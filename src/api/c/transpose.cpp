@@ -98,8 +98,11 @@ af_err af_transpose_inplace(af_array in, const bool conjugate) {
         // InPlace only works on square matrices
         DIM_ASSERT(0, dims[0] == dims[1]);
 
-        // If singleton element
-        if (dims[0] == 1) { return AF_SUCCESS; }
+        // A complex conjugate transpose still needs to conjugate every 1x1
+        // matrix in a batch. Other singleton transposes are no-ops.
+        if (dims[0] == 1 && (!conjugate || (type != c32 && type != c64))) {
+            return AF_SUCCESS;
+        }
 
         switch (type) {
             case f32: transpose_inplace<float>(in, conjugate); break;

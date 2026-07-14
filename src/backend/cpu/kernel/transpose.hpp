@@ -285,7 +285,7 @@ void transpose(Param<T> out, CParam<T> in, const bool conjugate) {
 }
 
 template<typename T, bool conjugate>
-void transpose_inplace(Param<T> input) {
+void transpose_inplace_serial(Param<T> input) {
     const af::dim4 idims    = input.dims();
     const af::dim4 istrides = input.strides();
 
@@ -293,23 +293,27 @@ void transpose_inplace(Param<T> input) {
 
     for (dim_t l = 0; l < idims[3]; ++l) {
         for (dim_t k = 0; k < idims[2]; ++k) {
-            // Outermost loop handles batch mode
-            // if input has no data along third dimension
-            // this loop runs only once
-            //
-            // Run only bottom triangle. std::swap swaps with upper triangle
+            const dim_t batch_offset = k * istrides[2] + l * istrides[3];
             for (dim_t j = 0; j < idims[1]; ++j) {
+                if constexpr (conjugate) {
+                    const dim_t diagonal =
+                        batch_offset + j * (istrides[0] + istrides[1]);
+                    in[diagonal] = getConjugate(in[diagonal]);
+                }
+
+                // Run only the bottom triangle. Each value is swapped with
+                // its corresponding value in the upper triangle.
                 for (dim_t i = j + 1; i < idims[0]; ++i) {
-                    // calculate array indices based on offsets and strides
-                    // the helper getIdx takes care of indices
-                    const dim_t iIdx = getIdx(istrides, j, i, k, l);
-                    const dim_t oIdx = getIdx(istrides, i, j, k, l);
-                    if (conjugate) {
-                        in[iIdx] = getConjugate(in[iIdx]);
-                        in[oIdx] = getConjugate(in[oIdx]);
-                        std::swap(in[iIdx], in[oIdx]);
+                    const dim_t lower =
+                        batch_offset + i * istrides[0] + j * istrides[1];
+                    const dim_t upper =
+                        batch_offset + j * istrides[0] + i * istrides[1];
+                    if constexpr (conjugate) {
+                        const T lower_value = in[lower];
+                        in[lower]           = getConjugate(in[upper]);
+                        in[upper]           = getConjugate(lower_value);
                     } else {
-                        std::swap(in[iIdx], in[oIdx]);
+                        std::swap(in[lower], in[upper]);
                     }
                 }
             }
@@ -317,10 +321,125 @@ void transpose_inplace(Param<T> input) {
     }
 }
 
+inline size_t triangularNumber(size_t row) {
+    return row % 2 == 0 ? (row / 2) * (row + 1) : row * ((row + 1) / 2);
+}
+
+inline size_t triangularRow(size_t index, size_t row_count) {
+    size_t low  = 0;
+    size_t high = row_count;
+    while (low + 1 < high) {
+        const size_t middle = low + (high - low) / 2;
+        if (triangularNumber(middle) <= index) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
+template<typename T, bool conjugate>
+void transpose_inplace_tiled(Param<T> input) {
+    const af::dim4 idims    = input.dims();
+    const af::dim4 istrides = input.strides();
+    T *const in             = input.get();
+
+    constexpr size_t tile_size = 32;
+    const size_t tile_count =
+        (static_cast<size_t>(idims[0]) + tile_size - 1) / tile_size;
+    const size_t pairs_per_matrix = triangularNumber(tile_count);
+    const size_t matrix_count =
+        static_cast<size_t>(idims[2]) * static_cast<size_t>(idims[3]);
+    const size_t pair_count = pairs_per_matrix * matrix_count;
+
+    constexpr size_t min_elements_per_task = 1 << 16;
+    constexpr size_t tile_elements         = tile_size * tile_size;
+    constexpr size_t min_pairs_per_task = min_elements_per_task / tile_elements;
+
+    parallelForRange(
+        pair_count, min_pairs_per_task, [=](size_t begin, size_t end) {
+            size_t matrix           = begin / pairs_per_matrix;
+            const size_t pair_index = begin % pairs_per_matrix;
+            size_t tile_row         = triangularRow(pair_index, tile_count);
+            size_t tile_column      = pair_index - triangularNumber(tile_row);
+            dim_t z                 = static_cast<dim_t>(matrix % idims[2]);
+            dim_t w                 = static_cast<dim_t>(matrix / idims[2]);
+
+            while (begin < end) {
+                const dim_t row_begin =
+                    static_cast<dim_t>(tile_row * tile_size);
+                const dim_t row_end =
+                    std::min<dim_t>(idims[0], row_begin + tile_size);
+                const dim_t column_begin =
+                    static_cast<dim_t>(tile_column * tile_size);
+                const dim_t column_end =
+                    std::min<dim_t>(idims[1], column_begin + tile_size);
+                const dim_t batch_offset = z * istrides[2] + w * istrides[3];
+
+                if (tile_row == tile_column) {
+                    for (dim_t y = row_begin; y < row_end; ++y) {
+                        if constexpr (conjugate) {
+                            const dim_t diagonal =
+                                batch_offset + y * (istrides[0] + istrides[1]);
+                            in[diagonal] = getConjugate(in[diagonal]);
+                        }
+                        for (dim_t x = y + 1; x < row_end; ++x) {
+                            const dim_t lower = batch_offset + x * istrides[0] +
+                                                y * istrides[1];
+                            const dim_t upper = batch_offset + y * istrides[0] +
+                                                x * istrides[1];
+                            if constexpr (conjugate) {
+                                const T lower_value = in[lower];
+                                in[lower]           = getConjugate(in[upper]);
+                                in[upper]           = getConjugate(lower_value);
+                            } else {
+                                std::swap(in[lower], in[upper]);
+                            }
+                        }
+                    }
+                } else {
+                    for (dim_t y = column_begin; y < column_end; ++y) {
+                        for (dim_t x = row_begin; x < row_end; ++x) {
+                            const dim_t lower = batch_offset + x * istrides[0] +
+                                                y * istrides[1];
+                            const dim_t upper = batch_offset + y * istrides[0] +
+                                                x * istrides[1];
+                            if constexpr (conjugate) {
+                                const T lower_value = in[lower];
+                                in[lower]           = getConjugate(in[upper]);
+                                in[upper]           = getConjugate(lower_value);
+                            } else {
+                                std::swap(in[lower], in[upper]);
+                            }
+                        }
+                    }
+                }
+
+                ++begin;
+                if (++tile_column > tile_row) {
+                    tile_column = 0;
+                    if (++tile_row == tile_count) {
+                        tile_row = 0;
+                        if (++z == idims[2]) {
+                            z = 0;
+                            ++w;
+                        }
+                    }
+                }
+            }
+        });
+}
+
 template<typename T>
 void transpose_inplace(Param<T> in, const bool conjugate) {
-    return (conjugate ? transpose_inplace<T, true>(in)
-                      : transpose_inplace<T, false>(in));
+    constexpr dim_t min_tiled_elements = 1 << 17;
+    if (in.dims().elements() < min_tiled_elements) {
+        return (conjugate ? transpose_inplace_serial<T, true>(in)
+                          : transpose_inplace_serial<T, false>(in));
+    }
+    return (conjugate ? transpose_inplace_tiled<T, true>(in)
+                      : transpose_inplace_tiled<T, false>(in));
 }
 
 }  // namespace kernel
