@@ -15,6 +15,7 @@
 #include <jit/BufferNode.hpp>
 #include <jit/Node.hpp>
 #include <jit/UnaryNode.hpp>
+#include <parallel.hpp>
 #include <platform.hpp>
 #include <vector>
 
@@ -97,7 +98,7 @@ void removeNodeOfOperation(
 /// set the output node to be its first non-moddim node child
 template<typename T>
 std::vector<TNode<T> *> getClonedOutputNodes(
-    common::Node_map_t &node_index_map,
+    const common::Node_map_t &node_index_map,
     const std::vector<std::shared_ptr<common::Node>> &node_clones,
     const std::vector<common::Node_ptr> &output_nodes_) {
     std::vector<TNode<T> *> cloned_output_nodes;
@@ -108,13 +109,13 @@ std::vector<TNode<T> *> getClonedOutputNodes(
             // if the output node is a moddims node, then set the output node
             // to be the child of the moddims node. This is necessary because
             // we remove the moddim node_index_map from the tree later
-            int child_index = node_index_map[n->m_children[0].get()];
+            int child_index = node_index_map.at(n->m_children[0].get());
             ptr = static_cast<TNode<T> *>(node_clones[child_index].get());
             while (ptr->getOp() == af_moddims_t) {
                 ptr = static_cast<TNode<T> *>(ptr->m_children[0].get());
             }
         } else {
-            int node_index = node_index_map[n.get()];
+            int node_index = node_index_map.at(n.get());
             ptr = static_cast<TNode<T> *>(node_clones[node_index].get());
         }
         cloned_output_nodes.push_back(ptr);
@@ -154,54 +155,95 @@ void evalMultiple(std::vector<Param<T>> arrays,
     bool is_linear = true;
     for (auto &node : node_clones) { is_linear &= node->isLinear(odims.get()); }
 
-    int num_nodes        = node_clones.size();
-    int num_output_nodes = cloned_output_nodes.size();
-    if (is_linear) {
-        int num = arrays[0].dims().elements();
-        int cnum =
-            jit::VECTOR_LENGTH * std::ceil(double(num) / jit::VECTOR_LENGTH);
-        for (int i = 0; i < cnum; i += jit::VECTOR_LENGTH) {
-            int lim = std::min(jit::VECTOR_LENGTH, num - i);
-            for (int n = 0; n < num_nodes; n++) {
-                node_clones[n]->calc(i, lim);
-            }
-            for (int n = 0; n < num_output_nodes; n++) {
-                std::copy(cloned_output_nodes[n]->m_val.begin(),
-                          cloned_output_nodes[n]->m_val.begin() + lim,
-                          ptrs[n] + i);
-            }
-        }
-    } else {
-        for (int w = 0; w < (int)odims[3]; w++) {
-            dim_t offw = w * ostrs[3];
+    const size_t num_nodes        = node_clones.size();
+    const size_t num_output_nodes = cloned_output_nodes.size();
+    const size_t dim0_chunks =
+        (static_cast<size_t>(odims[0]) + jit::VECTOR_LENGTH - 1) /
+        jit::VECTOR_LENGTH;
+    const size_t total_chunks =
+        is_linear
+            ? (static_cast<size_t>(odims.elements()) + jit::VECTOR_LENGTH - 1) /
+                  jit::VECTOR_LENGTH
+            : dim0_chunks * static_cast<size_t>(odims[1]) *
+                  static_cast<size_t>(odims[2]) * static_cast<size_t>(odims[3]);
 
-            for (int z = 0; z < (int)odims[2]; z++) {
-                dim_t offz = z * ostrs[2] + offw;
-
-                for (int y = 0; y < (int)odims[1]; y++) {
-                    dim_t offy = y * ostrs[1] + offz;
-
-                    int dim0  = odims[0];
-                    int cdim0 = jit::VECTOR_LENGTH *
-                                std::ceil(double(dim0) / jit::VECTOR_LENGTH);
-                    for (int x = 0; x < (int)cdim0; x += jit::VECTOR_LENGTH) {
-                        int lim  = std::min(jit::VECTOR_LENGTH, dim0 - x);
-                        dim_t id = x + offy;
-
-                        for (int n = 0; n < num_nodes; n++) {
-                            node_clones[n]->calc(x, y, z, w, lim);
-                        }
-                        for (int n = 0; n < num_output_nodes; n++) {
-                            std::copy(
-                                cloned_output_nodes[n]->m_val.begin(),
-                                cloned_output_nodes[n]->m_val.begin() + lim,
-                                ptrs[n] + id);
-                        }
-                    }
+    auto eval_chunk_range = [&](auto &nodes, auto &output_nodes,
+                                size_t chunk_begin, size_t chunk_end) {
+        if (is_linear) {
+            const dim_t num = odims.elements();
+            for (size_t chunk = chunk_begin; chunk < chunk_end; ++chunk) {
+                const dim_t id = chunk * jit::VECTOR_LENGTH;
+                const int lim  = static_cast<int>(
+                    std::min<dim_t>(jit::VECTOR_LENGTH, num - id));
+                for (size_t n = 0; n < num_nodes; ++n) {
+                    nodes[n]->calc(static_cast<int>(id), lim);
+                }
+                for (size_t n = 0; n < num_output_nodes; ++n) {
+                    std::copy(output_nodes[n]->m_val.begin(),
+                              output_nodes[n]->m_val.begin() + lim,
+                              ptrs[n] + id);
                 }
             }
+            return;
         }
-    }
+
+        const int dim0 = static_cast<int>(odims[0]);
+        for (size_t chunk = chunk_begin; chunk < chunk_end; ++chunk) {
+            size_t row = chunk / dim0_chunks;
+            const int x =
+                static_cast<int>(chunk % dim0_chunks) * jit::VECTOR_LENGTH;
+            const int y = static_cast<int>(row % odims[1]);
+            row /= odims[1];
+            const int z    = static_cast<int>(row % odims[2]);
+            const int w    = static_cast<int>(row / odims[2]);
+            const int lim  = std::min(jit::VECTOR_LENGTH, dim0 - x);
+            const dim_t id = x + y * ostrs[1] + z * ostrs[2] + w * ostrs[3];
+
+            for (size_t n = 0; n < num_nodes; ++n) {
+                nodes[n]->calc(x, y, z, w, lim);
+            }
+            for (size_t n = 0; n < num_output_nodes; ++n) {
+                std::copy(output_nodes[n]->m_val.begin(),
+                          output_nodes[n]->m_val.begin() + lim, ptrs[n] + id);
+            }
+        }
+    };
+
+    // Each node evaluation processes VECTOR_LENGTH elements. Use the JIT tree
+    // size when selecting a grain so complex expressions parallelize sooner,
+    // while small expressions avoid scheduling and graph-cloning overhead.
+    constexpr size_t min_node_chunks_per_task = 1024;
+    const size_t chunks_per_task              = std::max<size_t>(
+        1, min_node_chunks_per_task / std::max<size_t>(1, num_nodes));
+    const size_t useful_tasks =
+        (total_chunks + chunks_per_task - 1) / chunks_per_task;
+    constexpr size_t min_parallel_elements = 1 << 16;
+    const size_t task_count =
+        odims.elements() < static_cast<dim_t>(min_parallel_elements)
+            ? 1
+            : std::max<size_t>(
+                  1, std::min(getParallelThreadCount(), useful_tasks));
+
+    parallelFor(task_count, [&](size_t task) {
+        const size_t chunks_per_task = total_chunks / task_count;
+        const size_t remainder       = total_chunks % task_count;
+        const size_t chunk_begin =
+            task * chunks_per_task + std::min(task, remainder);
+        const size_t chunk_end =
+            chunk_begin + chunks_per_task + (task < remainder ? 1 : 0);
+        if (task == 0) {
+            eval_chunk_range(node_clones, cloned_output_nodes, chunk_begin,
+                             chunk_end);
+            return;
+        }
+
+        auto task_nodes = cloneNodes(full_nodes, ids);
+        auto task_output_nodes =
+            getClonedOutputNodes<T>(node_index_map, task_nodes, output_nodes_);
+        propagateModdimsShape(task_nodes);
+        removeNodeOfOperation(task_nodes, af_moddims_t);
+        eval_chunk_range(task_nodes, task_output_nodes, chunk_begin, chunk_end);
+    });
 }
 
 }  // namespace kernel

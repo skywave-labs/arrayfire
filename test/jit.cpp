@@ -108,7 +108,7 @@ TEST(JIT, CPP_JIT_Reset_Unary) {
 }
 
 TEST(JIT, CPP_Multi_linear) {
-    const int num = 1 << 16;
+    const int num = 1 << 20;
     array a       = randu(num, s32);
     array b       = randu(num, s32);
     array x       = a + b;
@@ -364,6 +364,58 @@ TEST(JIT, LinearLarge) {
     c.host(hc.data());
 
     for (size_t i = 0; i < hc.size(); i++) { ASSERT_EQ(hc[i], v3); }
+}
+
+TEST(JIT, ParallelNestedModdims) {
+    const dim4 dims(1024, 1024);
+    array input = randu(dims);
+    vector<float> hinput(input.elements());
+    input.host(hinput.data());
+
+    array nested =
+        af::moddims(af::moddims(input + 2.0f, dim4(512, 2048)), dims);
+    array output = nested * nested + nested;
+    output.eval();
+
+    vector<float> houtput(output.elements());
+    output.host(houtput.data());
+    for (size_t i = 0; i < houtput.size(); ++i) {
+        const float value = hinput[i] + 2.0f;
+        ASSERT_FLOAT_EQ(value * value + value, houtput[i]);
+    }
+}
+
+TEST(JIT, ParallelNonLinear4DTail) {
+    const int d0 = 257;
+    const int d1 = 129;
+    const int d2 = 3;
+    const int d3 = 2;
+    array lhs    = randu(d0, 1, d2, 1);
+    array rhs    = randu(1, d1, 1, d3);
+
+    array output = tile(lhs, 1, d1, 1, d3) * 2.0f + tile(rhs, d0, 1, d2, 1);
+    output.eval();
+
+    vector<float> hlhs(lhs.elements());
+    vector<float> hrhs(rhs.elements());
+    vector<float> houtput(output.elements());
+    lhs.host(hlhs.data());
+    rhs.host(hrhs.data());
+    output.host(houtput.data());
+
+    for (int w = 0; w < d3; ++w) {
+        for (int z = 0; z < d2; ++z) {
+            for (int y = 0; y < d1; ++y) {
+                for (int x = 0; x < d0; ++x) {
+                    const dim_t output_index = x + d0 * (y + d1 * (z + d2 * w));
+                    const dim_t lhs_index    = x + d0 * z;
+                    const dim_t rhs_index    = y + d1 * w;
+                    ASSERT_FLOAT_EQ(2.0f * hlhs[lhs_index] + hrhs[rhs_index],
+                                    houtput[output_index]);
+                }
+            }
+        }
+    }
 }
 
 TEST(JIT, NonLinearBuffers1) {

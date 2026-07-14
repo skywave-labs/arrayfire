@@ -229,6 +229,15 @@ tree after which evaluation is forced.
 
 The default value, as of v3.4, 100. This value was 20 for older versions.
 
+AF_CPU_NUM_THREADS {#af_cpu_num_threads}
+-------------------------------------------------------------------------------
+
+When set to a positive integer, this environment variable limits the number of
+threads used by each element-wise JIT evaluation in the CPU backend. The value
+is capped at the number of hardware threads reported by the operating system.
+The default is to use all available hardware threads for sufficiently large
+expressions; expressions smaller than 65,536 elements remain single-threaded.
+
 AF_BUILD_LIB_CUSTOM_PATH {#af_build_lib_custom_path}
 -------------------------------------------------------------------------------
 

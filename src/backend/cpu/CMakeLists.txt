@@ -122,6 +122,8 @@ target_sources(afcpu
     orb.cpp
     orb.hpp
     ParamIterator.hpp
+    parallel.cpp
+    parallel.hpp
     platform.cpp
     platform.hpp
     plot.cpp
