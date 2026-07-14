@@ -15,6 +15,8 @@
 #include <parallel.hpp>
 
 #include <algorithm>
+#include <array>
+#include <vector>
 
 namespace arrayfire {
 namespace cpu {
@@ -190,6 +192,69 @@ template<af_op_t op, typename Ti, typename To>
 struct reduce_all {
     common::Transform<data_t<Ti>, compute_t<To>, op> transform;
     common::Binary<compute_t<To>, op> reduce;
+
+    static constexpr bool exact_parallel_reduction =
+        op == af_min_t || op == af_max_t || op == af_notzero_t ||
+        op == af_or_t || op == af_and_t;
+
+    static compute_t<To> reduceRange(CParam<Ti> in, const size_t begin,
+                                     const size_t end, const bool is_linear,
+                                     const bool change_nan,
+                                     const double nanval) {
+        const af::dim4 dims            = in.dims();
+        const af::dim4 strides         = in.strides();
+        const data_t<Ti> *const in_ptr = in.get();
+        common::Transform<data_t<Ti>, compute_t<To>, op> local_transform;
+        common::Binary<compute_t<To>, op> local_reduce;
+        compute_t<To> value =
+            common::Binary<compute_t<To>, op>::init();
+
+        const auto accumulate = [&](const data_t<Ti> input) {
+            compute_t<To> input_value = local_transform(input);
+            if (change_nan) {
+                input_value = IS_NAN(input_value) ? nanval : input_value;
+            }
+            value = local_reduce(input_value, value);
+
+            if constexpr (op == af_or_t) {
+                return value != compute_t<To>(0);
+            } else if constexpr (op == af_and_t) {
+                return value == compute_t<To>(0);
+            } else {
+                return false;
+            }
+        };
+
+        if (is_linear) {
+            for (size_t item = begin; item < end; ++item) {
+                if (accumulate(in_ptr[item])) { break; }
+            }
+            return value;
+        }
+
+        size_t linear = begin;
+        std::array<dim_t, 4> coord;
+        for (int dim = 0; dim < 4; ++dim) {
+            coord[dim] =
+                static_cast<dim_t>(linear % static_cast<size_t>(dims[dim]));
+            linear /= static_cast<size_t>(dims[dim]);
+        }
+
+        for (size_t item = begin; item < end; ++item) {
+            // Keep the existing reduce_all assumption that stride 0 is one.
+            const dim_t offset = coord[0] + coord[1] * strides[1] +
+                                 coord[2] * strides[2] +
+                                 coord[3] * strides[3];
+            if (accumulate(in_ptr[offset])) { break; }
+
+            for (int dim = 0; dim < 4; ++dim) {
+                if (++coord[dim] < dims[dim]) { break; }
+                coord[dim] = 0;
+            }
+        }
+        return value;
+    }
+
     void operator()(Param<To> out, CParam<Ti> in, bool change_nan,
                     double nanval) {
         // Decrement dimension of select dimension
@@ -197,6 +262,60 @@ struct reduce_all {
         af::dim4 strides         = in.strides();
         const data_t<Ti> *inPtr  = in.get();
         data_t<To> *const outPtr = out.get();
+
+        if constexpr (exact_parallel_reduction) {
+            constexpr size_t block_elements        = 1 << 16;
+            constexpr size_t min_parallel_elements = 1 << 17;
+            constexpr size_t max_blocks            = 1024;
+            const size_t elements = static_cast<size_t>(dims.elements());
+
+            if (elements >= min_parallel_elements &&
+                getParallelThreadCount() > 1) {
+                const size_t requested_blocks =
+                    1 + (elements - 1) / block_elements;
+                const size_t block_count =
+                    std::min(max_blocks, requested_blocks);
+                std::vector<compute_t<To>> partials(block_count);
+
+                dim_t contiguous_elements = 1;
+                bool is_linear            = true;
+                for (int dim = 0; dim < 4; ++dim) {
+                    if (dims[dim] > 1 && strides[dim] != contiguous_elements) {
+                        is_linear = false;
+                        break;
+                    }
+                    contiguous_elements *= dims[dim];
+                }
+
+                parallelForRange(
+                    block_count, 1,
+                    [&](const size_t block_begin, const size_t block_end) {
+                        const size_t elements_per_block =
+                            elements / block_count;
+                        const size_t remainder = elements % block_count;
+                        for (size_t block = block_begin; block < block_end;
+                             ++block) {
+                            const size_t begin =
+                                block * elements_per_block +
+                                std::min(block, remainder);
+                            const size_t end =
+                                begin + elements_per_block +
+                                (block < remainder ? 1 : 0);
+                            partials[block] =
+                                reduceRange(in, begin, end, is_linear,
+                                            change_nan, nanval);
+                        }
+                    });
+
+                compute_t<To> out_val =
+                    common::Binary<compute_t<To>, op>::init();
+                for (const compute_t<To> partial : partials) {
+                    out_val = reduce(partial, out_val);
+                }
+                *outPtr = data_t<To>(out_val);
+                return;
+            }
+        }
 
         compute_t<To> out_val = common::Binary<compute_t<To>, op>::init();
 
