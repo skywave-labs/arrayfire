@@ -11,6 +11,9 @@
 #include <Param.hpp>
 #include <common/Binary.hpp>
 #include <common/Transform.hpp>
+#include <parallel.hpp>
+
+#include <algorithm>
 
 namespace arrayfire {
 namespace cpu {
@@ -70,6 +73,29 @@ struct scan_dim<op, Ti, To, 0, inclusive_scan> {
         }
     }
 };
+
+template<af_op_t op, typename Ti, typename To, bool inclusive_scan>
+void scan_dim_parallel(Param<To> out, CParam<Ti> in, const int dim) {
+    af::dim4 line_dims      = out.dims();
+    const af::dim4 ostrides = out.strides();
+    const af::dim4 istrides = in.strides();
+    const size_t scanned_elements =
+        std::max<size_t>(1, static_cast<size_t>(in.dims()[dim]));
+    line_dims[dim] = 1;
+
+    constexpr size_t min_input_elements_per_task = 1 << 16;
+    const size_t min_lines_per_task =
+        std::max<size_t>(1, min_input_elements_per_task / scanned_elements);
+    parallelForEach(
+        line_dims, min_lines_per_task, [=](dim_t x, dim_t y, dim_t z, dim_t w) {
+            const dim_t out_offset = x * ostrides[0] + y * ostrides[1] +
+                                     z * ostrides[2] + w * ostrides[3];
+            const dim_t in_offset = x * istrides[0] + y * istrides[1] +
+                                    z * istrides[2] + w * istrides[3];
+            scan_dim<op, Ti, To, 0, inclusive_scan> scan_line;
+            scan_line(out, out_offset, in, in_offset, dim);
+        });
+}
 
 }  // namespace kernel
 }  // namespace cpu

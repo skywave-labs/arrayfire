@@ -227,6 +227,41 @@ TEST(Transpose, CPP_c32_CONJ2000x1) { trsCPPConjTest<cfloat>(2000); }
 
 TEST(Transpose, CPP_c32_CONJ20x20x5) { trsCPPConjTest<cfloat>(20, 20, 5); }
 
+TEST(Transpose, OddBatchedDimensions) {
+    const dim4 dims(257, 67, 3, 5);
+    const dim4 outputDims(dims[1], dims[0], dims[2], dims[3]);
+    vector<cfloat> inputData(dims.elements());
+    vector<cfloat> transposeGold(dims.elements());
+    vector<cfloat> conjugateGold(dims.elements());
+
+    for (dim_t w = 0; w < dims[3]; ++w) {
+        for (dim_t z = 0; z < dims[2]; ++z) {
+            for (dim_t y = 0; y < dims[1]; ++y) {
+                for (dim_t x = 0; x < dims[0]; ++x) {
+                    const size_t inputIdx =
+                        x + dims[0] * (y + dims[1] * (z + dims[2] * w));
+                    const size_t outputIdx =
+                        y + dims[1] * (x + dims[0] * (z + dims[2] * w));
+                    const cfloat value(
+                        static_cast<float>((x + 3 * y + 5 * z + 7 * w) % 97),
+                        static_cast<float>((2 * x + y + 11 * z + 13 * w) % 89) -
+                            44.0f);
+                    inputData[inputIdx]      = value;
+                    transposeGold[outputIdx] = value;
+                    conjugateGold[outputIdx] = cfloat(value.real, -value.imag);
+                }
+            }
+        }
+    }
+
+    const array input(dims, inputData.data());
+    const array output          = transpose(input, false);
+    const array conjugateOutput = transpose(input, true);
+
+    ASSERT_VEC_ARRAY_EQ(transposeGold, outputDims, output);
+    ASSERT_VEC_ARRAY_EQ(conjugateGold, outputDims, conjugateOutput);
+}
+
 TEST(Transpose, MaxDim) {
     const size_t largeDim = 65535 * 33 + 1;
 

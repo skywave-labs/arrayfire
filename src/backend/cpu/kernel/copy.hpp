@@ -10,9 +10,11 @@
 #pragma once
 #include <Param.hpp>
 #include <math.hpp>
+#include <parallel.hpp>
 #include <af/defines.h>
 #include <af/dim4.hpp>
 
+#include <algorithm>
 #include <cstring>  //memcpy
 
 namespace arrayfire {
@@ -56,39 +58,60 @@ void copyElemwise(Param<OutT> dst, CParam<InT> src, OutT default_value,
     dim_t trgt_j = std::min(dst_dims[1], src_dims[1]);
     dim_t trgt_i = std::min(dst_dims[0], src_dims[0]);
 
-    for (dim_t l = 0; l < dst_dims[3]; ++l) {
-        dim_t src_loff = l * src_strides[3];
-        dim_t dst_loff = l * dst_strides[3];
-        bool isLvalid  = l < trgt_l;
+    constexpr size_t min_elements_per_task = 1 << 18;
+    parallelForRange(
+        static_cast<size_t>(dst_dims.elements()), min_elements_per_task,
+        [=](size_t begin, size_t end) {
+            size_t linear = begin;
+            dim_t i       = static_cast<dim_t>(linear % dst_dims[0]);
+            linear /= static_cast<size_t>(dst_dims[0]);
+            dim_t j = static_cast<dim_t>(linear % dst_dims[1]);
+            linear /= static_cast<size_t>(dst_dims[1]);
+            dim_t k = static_cast<dim_t>(linear % dst_dims[2]);
+            dim_t l = static_cast<dim_t>(linear / dst_dims[2]);
 
-        for (dim_t k = 0; k < dst_dims[2]; ++k) {
-            dim_t src_koff = k * src_strides[2];
-            dim_t dst_koff = k * dst_strides[2];
-            bool isKvalid  = k < trgt_k;
+            while (begin < end) {
+                const size_t run = std::min<size_t>(
+                    end - begin, static_cast<size_t>(dst_dims[0] - i));
+                dim_t dst_idx = i * dst_strides[0] + j * dst_strides[1] +
+                                k * dst_strides[2] + l * dst_strides[3];
+                size_t valid  = 0;
+                dim_t src_idx = 0;
+                if (l < trgt_l && k < trgt_k && j < trgt_j && i < trgt_i) {
+                    valid =
+                        std::min<size_t>(run, static_cast<size_t>(trgt_i - i));
+                    src_idx = i * src_strides[0] + j * src_strides[1] +
+                              k * src_strides[2] + l * src_strides[3];
+                }
 
-            for (dim_t j = 0; j < dst_dims[1]; ++j) {
-                dim_t src_joff = j * src_strides[1];
-                dim_t dst_joff = j * dst_strides[1];
-                bool isJvalid  = j < trgt_j;
+                for (size_t element = 0; element < valid; ++element) {
+                    // The conversions here are necessary because the half type
+                    // does not convert to complex automatically.
+                    dst_ptr[dst_idx] =
+                        compute_t<OutT>(compute_t<InT>(src_ptr[src_idx])) *
+                        compute_t<OutT>(factor);
+                    src_idx += src_strides[0];
+                    dst_idx += dst_strides[0];
+                }
+                for (size_t element = valid; element < run; ++element) {
+                    dst_ptr[dst_idx] = default_value;
+                    dst_idx += dst_strides[0];
+                }
 
-                for (dim_t i = 0; i < dst_dims[0]; ++i) {
-                    data_t<OutT> temp = default_value;
-                    if (isLvalid && isKvalid && isJvalid && i < trgt_i) {
-                        dim_t src_idx =
-                            i * src_strides[0] + src_joff + src_koff + src_loff;
-                        // The conversions here are necessary because the half
-                        // type does not convert to complex automatically
-                        temp =
-                            compute_t<OutT>(compute_t<InT>(src_ptr[src_idx])) *
-                            compute_t<OutT>(factor);
+                begin += run;
+                i += static_cast<dim_t>(run);
+                if (i == dst_dims[0]) {
+                    i = 0;
+                    if (++j == dst_dims[1]) {
+                        j = 0;
+                        if (++k == dst_dims[2]) {
+                            k = 0;
+                            ++l;
+                        }
                     }
-                    dim_t dst_idx =
-                        i * dst_strides[0] + dst_joff + dst_koff + dst_loff;
-                    dst_ptr[dst_idx] = temp;
                 }
             }
-        }
-    }
+        });
 }
 
 template<typename OutT, typename InT>
@@ -116,6 +139,18 @@ struct CopyImpl<T, T> {
                count == dst_strides[linear_end]) {
             count *= src_dims[linear_end];
             ++linear_end;
+        }
+
+        if (linear_end == 4) {
+            constexpr size_t min_bytes_per_task = 1 << 20;
+            const size_t min_elements_per_task =
+                std::max<size_t>(1, min_bytes_per_task / sizeof(T));
+            parallelForRange(static_cast<size_t>(count), min_elements_per_task,
+                             [=](size_t begin, size_t end) {
+                                 std::memcpy(dst_ptr + begin, src_ptr + begin,
+                                             (end - begin) * sizeof(T));
+                             });
+            return;
         }
 
         // traverse through the array using strides only until neccessary
