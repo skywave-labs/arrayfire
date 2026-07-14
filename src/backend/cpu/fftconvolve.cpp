@@ -11,9 +11,7 @@
 
 #include <Array.hpp>
 #include <common/dispatch.hpp>
-#include <err_cpu.hpp>
 #include <fft.hpp>
-#include <fftw3.h>
 #include <kernel/fftconvolve.hpp>
 #include <queue.hpp>
 #include <af/dim4.hpp>
@@ -21,8 +19,6 @@
 #include <array>
 #include <cmath>
 #include <functional>
-#include <mutex>
-#include <shared_mutex>
 #include <type_traits>
 
 using af::dim4;
@@ -31,37 +27,6 @@ using std::ceil;
 
 namespace arrayfire {
 namespace cpu {
-
-namespace {
-
-template<typename Create, typename Execute, typename Destroy>
-void executeFFTWPlan(Create create, Execute execute, Destroy destroy) {
-    const auto plan = [&]() {
-        std::unique_lock<std::shared_mutex> lock(fftwMutex());
-        return create();
-    }();
-    if (plan == nullptr) {
-        AF_ERROR("FFTW plan creation failed", AF_ERR_INTERNAL);
-    }
-
-    try {
-#ifdef USE_MKL
-        std::unique_lock<std::shared_mutex> lock(fftwMutex());
-#else
-        std::shared_lock<std::shared_mutex> lock(fftwMutex());
-#endif
-        execute(plan);
-    } catch (...) {
-        std::unique_lock<std::shared_mutex> lock(fftwMutex());
-        destroy(plan);
-        throw;
-    }
-
-    std::unique_lock<std::shared_mutex> lock(fftwMutex());
-    destroy(plan);
-}
-
-}  // namespace
 
 template<typename T, typename convT>
 using reorderFunc = std::function<void(
@@ -76,8 +41,8 @@ Array<T> fftconvolve(Array<T> const& signal, Array<T> const& filter,
     using convT = typename std::conditional<std::is_integral<T>::value ||
                                                 std::is_same<T, float>::value,
                                             float, double>::type;
-
-    constexpr bool IsTypeDouble = std::is_same<T, double>::value;
+    using complexT = typename std::conditional<std::is_same<convT, float>::value,
+                                               cfloat, cdouble>::type;
 
     const dim4& sd = signal.dims();
     const dim4& fd = filter.dims();
@@ -131,85 +96,30 @@ Array<T> fftconvolve(Array<T> const& signal, Array<T> const& filter,
                        paddedFilStrides, filter, offset);
 
     // NOLINTNEXTLINE(performance-unnecessary-value-param)
-    auto upstream_dft = [=](Param<convT> packed,
-                            const array<int, AF_MAX_DIMS> fftDims) {
+    auto upstream_dft = [=](Param<convT> packed, const bool direction) {
         const dim4 packedDims     = packed.dims();
         const dim4 packed_strides = packed.strides();
-        // Compute forward FFT
-        if (IsTypeDouble) {
-            executeFFTWPlan(
-                [&]() {
-                    return fftw_plan_many_dft(
-                        rank, fftDims.data(), packedDims[rank],
-                        reinterpret_cast<fftw_complex*>(packed.get()), nullptr,
-                        packed_strides[0], packed_strides[rank] / 2,
-                        reinterpret_cast<fftw_complex*>(packed.get()), nullptr,
-                        packed_strides[0], packed_strides[rank] / 2,
-                        FFTW_FORWARD,
-                        FFTW_ESTIMATE);  // NOLINT(hicpp-signed-bitwise)
-                },
-                [](fftw_plan plan) { fftw_execute(plan); },
-                [](fftw_plan plan) { fftw_destroy_plan(plan); });
-        } else {
-            executeFFTWPlan(
-                [&]() {
-                    return fftwf_plan_many_dft(
-                        rank, fftDims.data(), packedDims[rank],
-                        reinterpret_cast<fftwf_complex*>(packed.get()), nullptr,
-                        packed_strides[0], packed_strides[rank] / 2,
-                        reinterpret_cast<fftwf_complex*>(packed.get()), nullptr,
-                        packed_strides[0], packed_strides[rank] / 2,
-                        FFTW_FORWARD,
-                        FFTW_ESTIMATE);  // NOLINT(hicpp-signed-bitwise)
-                },
-                [](fftwf_plan plan) { fftwf_execute(plan); },
-                [](fftwf_plan plan) { fftwf_destroy_plan(plan); });
-        }
+
+        dim4 complexDims    = packedDims;
+        dim4 complexStrides = packed_strides;
+        complexDims[0] /= 2;
+        // The allocation stores interleaved complex values in scalar units.
+        // Higher-dimensional strides therefore halve in the complex view.
+        for (int i = 1; i < AF_MAX_DIMS; ++i) { complexStrides[i] /= 2; }
+
+        Param<complexT> complexPacked(
+            reinterpret_cast<complexT*>(packed.get()), complexDims,
+            complexStrides);
+        fft_inplace(complexPacked, complexDims, rank, direction);
     };
-    getQueue().enqueue(upstream_dft, packed, fftDims);
+    getQueue().enqueue(upstream_dft, packed, true);
 
     // Multiply filter and signal FFT arrays
     getQueue().enqueue(kernel::complexMultiply<convT>, packed, paddedSigDims,
                        paddedSigStrides, paddedFilDims, paddedFilStrides, kind,
                        offset);
 
-    // NOLINTNEXTLINE(performance-unnecessary-value-param)
-    auto upstream_idft = [=](Param<convT> packed,
-                             const array<int, AF_MAX_DIMS> fftDims) {
-        const dim4 packedDims     = packed.dims();
-        const dim4 packed_strides = packed.strides();
-        // Compute inverse FFT
-        if (IsTypeDouble) {
-            executeFFTWPlan(
-                [&]() {
-                    return fftw_plan_many_dft(
-                        rank, fftDims.data(), packedDims[rank],
-                        reinterpret_cast<fftw_complex*>(packed.get()), nullptr,
-                        packed_strides[0], packed_strides[rank] / 2,
-                        reinterpret_cast<fftw_complex*>(packed.get()), nullptr,
-                        packed_strides[0], packed_strides[rank] / 2,
-                        FFTW_BACKWARD,
-                        FFTW_ESTIMATE);  // NOLINT(hicpp-signed-bitwise)
-                },
-                [](fftw_plan plan) { fftw_execute(plan); },
-                [](fftw_plan plan) { fftw_destroy_plan(plan); });
-        } else {
-            executeFFTWPlan(
-                [&]() {
-                    return fftwf_plan_many_dft(
-                        rank, fftDims.data(), packedDims[rank],
-                        reinterpret_cast<fftwf_complex*>(packed.get()), nullptr,
-                        packed_strides[0], packed_strides[rank] / 2,
-                        reinterpret_cast<fftwf_complex*>(packed.get()), nullptr,
-                        packed_strides[0], packed_strides[rank] / 2,
-                        FFTW_BACKWARD,
-                        FFTW_ESTIMATE);  // NOLINT(hicpp-signed-bitwise)
-                },
-                [](fftwf_plan plan) { fftwf_execute(plan); },
-                [](fftwf_plan plan) { fftwf_destroy_plan(plan); });
-        }
-    };
-    getQueue().enqueue(upstream_idft, packed, fftDims);
+    getQueue().enqueue(upstream_dft, packed, false);
 
     // Compute output dimensions
     dim4 oDims(1);

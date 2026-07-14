@@ -21,12 +21,14 @@
 
 using af::array;
 using af::cfloat;
+using af::convolve2;
 using af::dim4;
 using af::dtype;
 using af::fft;
 using af::fft2InPlace;
 using af::fft3InPlace;
 using af::fftC2R;
+using af::fftConvolve2;
 using af::fftInPlace;
 using af::fftR2C;
 using af::ifft2InPlace;
@@ -158,6 +160,56 @@ TEST_F(FFTPlanCacheTest, SamePlanDifferentBuffers) {
 
     ASSERT_ARRAYS_NEAR(realFirst, firstReal, 1e-3);
     ASSERT_ARRAYS_NEAR(realSecond, secondReal, 1e-3);
+}
+
+TEST_F(FFTPlanCacheTest, FFTConvolveCacheDisabledAndEvicted) {
+    const array signal = randu(dim4(29, 23), f32);
+    const array filter = randu(dim4(7, 5), f32);
+    const array expected =
+        convolve2(signal, filter, AF_CONV_DEFAULT, AF_CONV_SPATIAL);
+    expected.eval();
+    af::sync();
+
+    af::setFFTPlanCacheSize(0);
+    const array disabled = fftConvolve2(signal, filter);
+    ASSERT_ARRAYS_NEAR(expected, disabled, 2e-4);
+
+    // A single entry continually evicts the forward and inverse plans. It
+    // should preserve uncached behavior even though it cannot provide reuse.
+    af::setFFTPlanCacheSize(1);
+    const array evicted = fftConvolve2(signal, filter);
+    ASSERT_ARRAYS_NEAR(expected, evicted, 2e-4);
+}
+
+TEST_F(FFTPlanCacheTest, FFTConvolveSamePlanDifferentPackedBuffers) {
+    const array firstSignal  = randu(dim4(31, 19), f32);
+    const array secondSignal = randu(dim4(31, 19), f32);
+    const array firstFilter  = randu(dim4(5, 7), f32);
+    const array secondFilter = randu(dim4(5, 7), f32);
+
+    const array firstExpected =
+        convolve2(firstSignal, firstFilter, AF_CONV_DEFAULT, AF_CONV_SPATIAL);
+    const array secondExpected = convolve2(secondSignal, secondFilter,
+                                           AF_CONV_DEFAULT, AF_CONV_SPATIAL);
+    firstExpected.eval();
+    secondExpected.eval();
+    af::sync();
+
+    af::setFFTPlanCacheSize(0);
+    af::setFFTPlanCacheSize(2);
+
+    const array firstActual = fftConvolve2(firstSignal, firstFilter);
+
+    // This shape exactly matches the first call's internal scalar-packed
+    // allocation. Keep that recycled address locked so the second call must
+    // execute the cached plan on a different buffer.
+    const array packedAddressGuard = randu(dim4(64, 32, 2), f32);
+    packedAddressGuard.eval();
+
+    const array secondActual = fftConvolve2(secondSignal, secondFilter);
+
+    ASSERT_ARRAYS_NEAR(firstExpected, firstActual, 2e-4);
+    ASSERT_ARRAYS_NEAR(secondExpected, secondActual, 2e-4);
 }
 
 TEST_F(FFTPlanCacheTest, EvictionResizeAndBatchedKeys) {

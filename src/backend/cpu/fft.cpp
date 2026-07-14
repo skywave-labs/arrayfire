@@ -351,42 +351,48 @@ void setFFTPlanCacheSize(size_t numPlans) {
 }
 
 template<typename T>
+void fft_inplace(Param<T> in, const af::dim4 iDataDims, const int rank,
+                 const bool direction) {
+    const af::dim4 idims = in.dims();
+
+    auto t_dims   = computeDims(rank, idims);
+    auto in_embed = computeDims(rank, iDataDims);
+
+    const af::dim4 istrides = in.strides();
+
+    using ctype_t = typename fftw_transform<T>::ctype_t;
+    fftw_transform<T> transform;
+
+    int batch = 1;
+    for (int i = rank; i < 4; i++) { batch *= idims[i]; }
+
+    const int fftwDirection = direction ? FFTW_FORWARD : FFTW_BACKWARD;
+    constexpr unsigned flags =
+        FFTW_ESTIMATE;  // NOLINT(hicpp-signed-bitwise)
+    const auto key = makePlanKey(FFTTransformKind::C2C, rank, t_dims, batch,
+                                 in_embed, static_cast<int>(istrides[0]),
+                                 static_cast<int>(istrides[rank]), in_embed,
+                                 static_cast<int>(istrides[0]),
+                                 static_cast<int>(istrides[rank]),
+                                 fftwDirection, flags, in.get(), in.get());
+
+    auto plan = getFFTPlan<fftw_transform<T>>(key, [&]() {
+        return transform.create(
+            rank, t_dims.data(), batch,
+            reinterpret_cast<ctype_t *>(in.get()), in_embed.data(),
+            static_cast<int>(istrides[0]), static_cast<int>(istrides[rank]),
+            reinterpret_cast<ctype_t *>(in.get()), in_embed.data(),
+            static_cast<int>(istrides[0]), static_cast<int>(istrides[rank]),
+            fftwDirection, flags);
+    });
+
+    executeFFTPlan(plan, transform, in.get(), in.get());
+}
+
+template<typename T>
 void fft_inplace(Array<T> &in, const int rank, const bool direction) {
     auto func = [=](Param<T> in, const af::dim4 iDataDims) {
-        const af::dim4 idims = in.dims();
-
-        auto t_dims   = computeDims(rank, idims);
-        auto in_embed = computeDims(rank, iDataDims);
-
-        const af::dim4 istrides = in.strides();
-
-        using ctype_t = typename fftw_transform<T>::ctype_t;
-        fftw_transform<T> transform;
-
-        int batch = 1;
-        for (int i = rank; i < 4; i++) { batch *= idims[i]; }
-
-        const int fftwDirection = direction ? FFTW_FORWARD : FFTW_BACKWARD;
-        constexpr unsigned flags =
-            FFTW_ESTIMATE;  // NOLINT(hicpp-signed-bitwise)
-        const auto key = makePlanKey(FFTTransformKind::C2C, rank, t_dims, batch,
-                                     in_embed, static_cast<int>(istrides[0]),
-                                     static_cast<int>(istrides[rank]), in_embed,
-                                     static_cast<int>(istrides[0]),
-                                     static_cast<int>(istrides[rank]),
-                                     fftwDirection, flags, in.get(), in.get());
-
-        auto plan = getFFTPlan<fftw_transform<T>>(key, [&]() {
-            return transform.create(
-                rank, t_dims.data(), batch,
-                reinterpret_cast<ctype_t *>(in.get()), in_embed.data(),
-                static_cast<int>(istrides[0]), static_cast<int>(istrides[rank]),
-                reinterpret_cast<ctype_t *>(in.get()), in_embed.data(),
-                static_cast<int>(istrides[0]), static_cast<int>(istrides[rank]),
-                fftwDirection, flags);
-        });
-
-        executeFFTPlan(plan, transform, in.get(), in.get());
+        fft_inplace(in, iDataDims, rank, direction);
     };
     getQueue().enqueue(func, in, in.getDataDims());
 }
@@ -508,7 +514,9 @@ Array<Tr> fft_c2r(const Array<Tc> &in, const dim4 &odims, const int rank) {
     return out;
 }
 
-#define INSTANTIATE(T) \
+#define INSTANTIATE(T)                                                      \
+    template void fft_inplace<T>(Param<T>, const af::dim4, const int,       \
+                                 const bool);                               \
     template void fft_inplace<T>(Array<T> &, const int, const bool);
 
 INSTANTIATE(cfloat)

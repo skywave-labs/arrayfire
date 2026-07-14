@@ -23,6 +23,12 @@ std::shared_mutex &fftwMutex();
 
 void setFFTPlanCacheSize(size_t numPlans);
 
+// Execute immediately; callers that are not already on the CPU worker queue
+// should use the Array overload below.
+template<typename T>
+void fft_inplace(Param<T> in, const af::dim4 dataDims, const int rank,
+                 const bool direction);
+
 template<typename T>
 void fft_inplace(Array<T> &in, const int rank, const bool direction);
 
