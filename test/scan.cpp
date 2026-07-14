@@ -165,6 +165,60 @@ TEST(Accum, CPP) {
     }
 }
 
+TEST(Scan, InclusiveAndExclusiveOddBatchedLines) {
+    const dim4 dims(131, 37, 5, 7);
+    const dim_t strides[] = {1, dims[0], dims[0] * dims[1],
+                             dims[0] * dims[1] * dims[2]};
+    vector<int> inputData(dims.elements());
+
+    for (dim_t w = 0; w < dims[3]; ++w) {
+        for (dim_t z = 0; z < dims[2]; ++z) {
+            for (dim_t y = 0; y < dims[1]; ++y) {
+                for (dim_t x = 0; x < dims[0]; ++x) {
+                    const size_t idx = x * strides[0] + y * strides[1] +
+                                       z * strides[2] + w * strides[3];
+                    inputData[idx] =
+                        static_cast<int>((x + 2 * y + 3 * z + 5 * w) % 7) - 3;
+                }
+            }
+        }
+    }
+
+    const array input(dims, inputData.data());
+    const bool inclusiveModes[] = {true, false};
+    for (const bool inclusive : inclusiveModes) {
+        for (int dim = 0; dim < 4; ++dim) {
+            SCOPED_TRACE(::testing::Message()
+                         << "dimension " << dim << ", inclusive " << inclusive);
+            vector<int> gold(dims.elements());
+
+            for (dim_t w = 0; w < dims[3]; ++w) {
+                for (dim_t z = 0; z < dims[2]; ++z) {
+                    for (dim_t y = 0; y < dims[1]; ++y) {
+                        for (dim_t x = 0; x < dims[0]; ++x) {
+                            const dim_t coords[] = {x, y, z, w};
+                            const size_t idx = x * strides[0] + y * strides[1] +
+                                               z * strides[2] + w * strides[3];
+                            if (coords[dim] == 0) {
+                                gold[idx] = inclusive ? inputData[idx] : 0;
+                            } else {
+                                const size_t previousIdx = idx - strides[dim];
+                                gold[idx] =
+                                    gold[previousIdx] +
+                                    (inclusive ? inputData[idx]
+                                               : inputData[previousIdx]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            const array output = scan(input, dim, AF_BINARY_ADD, inclusive);
+            ASSERT_VEC_ARRAY_EQ(gold, dims, output);
+        }
+    }
+}
+
 TEST(Accum, MaxDim) {
     const size_t largeDim = 65535 * 32 + 1;
 

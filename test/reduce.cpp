@@ -340,6 +340,62 @@ CPP_REDUCE_TESTS(anyTrue, any_true, float, unsigned char);
 CPP_REDUCE_TESTS(allTrue, all_true, float, unsigned char);
 CPP_REDUCE_TESTS(count, count, float, unsigned);
 
+TEST(Reduce, DimensionalSumOddBatchedLines) {
+    const dim4 inputDims(257, 67, 5, 7);
+    vector<int> inputData(inputDims.elements());
+
+    for (dim_t w = 0; w < inputDims[3]; ++w) {
+        for (dim_t z = 0; z < inputDims[2]; ++z) {
+            for (dim_t y = 0; y < inputDims[1]; ++y) {
+                for (dim_t x = 0; x < inputDims[0]; ++x) {
+                    const size_t inputIdx =
+                        x + inputDims[0] *
+                                (y + inputDims[1] * (z + inputDims[2] * w));
+                    inputData[inputIdx] =
+                        static_cast<int>((x + 2 * y + 3 * z + 5 * w) % 11) - 5;
+                }
+            }
+        }
+    }
+
+    const array input(inputDims, inputData.data());
+    const dim_t inputStrides[] = {1, inputDims[0], inputDims[0] * inputDims[1],
+                                  inputDims[0] * inputDims[1] * inputDims[2]};
+
+    for (int dim = 0; dim < 4; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        dim4 outputDims             = inputDims;
+        outputDims[dim]             = 1;
+        const dim_t outputStrides[] = {
+            1, outputDims[0], outputDims[0] * outputDims[1],
+            outputDims[0] * outputDims[1] * outputDims[2]};
+        vector<int> gold(outputDims.elements(), 0);
+
+        for (dim_t w = 0; w < inputDims[3]; ++w) {
+            for (dim_t z = 0; z < inputDims[2]; ++z) {
+                for (dim_t y = 0; y < inputDims[1]; ++y) {
+                    for (dim_t x = 0; x < inputDims[0]; ++x) {
+                        const dim_t coords[] = {x, y, z, w};
+                        const size_t inputIdx =
+                            x * inputStrides[0] + y * inputStrides[1] +
+                            z * inputStrides[2] + w * inputStrides[3];
+                        size_t outputIdx = 0;
+                        for (int d = 0; d < 4; ++d) {
+                            if (d != dim) {
+                                outputIdx += coords[d] * outputStrides[d];
+                            }
+                        }
+                        gold[outputIdx] += inputData[inputIdx];
+                    }
+                }
+            }
+        }
+
+        const array output = sum(input, dim);
+        ASSERT_VEC_ARRAY_EQ(gold, outputDims, output);
+    }
+}
+
 struct reduce_by_key_params {
     size_t iSize, oSize;
     void *iKeys_;

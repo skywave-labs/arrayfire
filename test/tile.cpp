@@ -141,6 +141,46 @@ TEST(Tile, CPP) {
     ASSERT_VEC_ARRAY_EQ(tests[resultIdx], goldDims, output);
 }
 
+TEST(Tile, OddBatchedRowCopies) {
+    const dim4 inputDims(37, 13, 5, 1);
+    const dim4 repeats(7, 5, 1, 7);
+    const dim4 outputDims(inputDims[0] * repeats[0], inputDims[1] * repeats[1],
+                          inputDims[2] * repeats[2], inputDims[3] * repeats[3]);
+    vector<int> inputData(inputDims.elements());
+    vector<int> gold(outputDims.elements());
+
+    for (size_t i = 0; i < inputData.size(); ++i) {
+        inputData[i] = static_cast<int>(i);
+    }
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    const size_t outputIdx =
+                        x + outputDims[0] *
+                                (y + outputDims[1] * (z + outputDims[2] * w));
+                    const dim_t inputX = x % inputDims[0];
+                    const dim_t inputY = y % inputDims[1];
+                    const dim_t inputZ = z % inputDims[2];
+                    const dim_t inputW = w % inputDims[3];
+                    const size_t inputIdx =
+                        inputX +
+                        inputDims[0] *
+                            (inputY +
+                             inputDims[1] * (inputZ + inputDims[2] * inputW));
+                    gold[outputIdx] = inputData[inputIdx];
+                }
+            }
+        }
+    }
+
+    const array input(inputDims, inputData.data());
+    const array output = af::tile(input, repeats);
+
+    ASSERT_VEC_ARRAY_EQ(gold, outputDims, output);
+}
+
 TEST(Tile, MaxDim) {
     const size_t largeDim = 65535 * 32 + 1;
     const unsigned x      = 1;

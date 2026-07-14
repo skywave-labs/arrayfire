@@ -208,5 +208,23 @@ void parallelFor(size_t task_count, std::function<void(size_t)> function) {
     if (state->exception) { std::rethrow_exception(state->exception); }
 }
 
+void parallelForRange(size_t item_count, size_t min_items_per_task,
+                      std::function<void(size_t begin, size_t end)> function) {
+    if (item_count == 0) { return; }
+
+    const size_t grain        = std::max<size_t>(1, min_items_per_task);
+    const size_t useful_tasks = std::max<size_t>(1, item_count / grain);
+    const size_t task_count =
+        std::max<size_t>(1, std::min(getParallelThreadCount(), useful_tasks));
+
+    parallelFor(task_count, [&](size_t task) {
+        const size_t items_per_task = item_count / task_count;
+        const size_t remainder      = item_count % task_count;
+        const size_t begin = task * items_per_task + std::min(task, remainder);
+        const size_t end = begin + items_per_task + (task < remainder ? 1 : 0);
+        function(begin, end);
+    });
+}
+
 }  // namespace cpu
 }  // namespace arrayfire

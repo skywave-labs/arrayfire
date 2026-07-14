@@ -155,6 +155,39 @@ TEST(Reorder, CPP) {
     ASSERT_VEC_ARRAY_EQ(tests[resultIdx], goldDims, output);
 }
 
+TEST(Reorder, OddBatchedDimensions) {
+    const dim4 inputDims(257, 67, 5, 7);
+    const dim4 outputDims(inputDims[2], inputDims[0], inputDims[3],
+                          inputDims[1]);
+    vector<int> inputData(inputDims.elements());
+    vector<int> gold(outputDims.elements());
+
+    for (size_t i = 0; i < inputData.size(); ++i) {
+        inputData[i] = static_cast<int>(i);
+    }
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    const size_t outputIdx =
+                        x + outputDims[0] *
+                                (y + outputDims[1] * (z + outputDims[2] * w));
+                    const size_t inputIdx =
+                        y + inputDims[0] *
+                                (w + inputDims[1] * (x + inputDims[2] * z));
+                    gold[outputIdx] = inputData[inputIdx];
+                }
+            }
+        }
+    }
+
+    const array input(inputDims, inputData.data());
+    const array output = reorder(input, 2, 0, 3, 1);
+
+    ASSERT_VEC_ARRAY_EQ(gold, outputDims, output);
+}
+
 TEST(Reorder, ISSUE_1777) {
     const int m = 5;
     const int n = 4;

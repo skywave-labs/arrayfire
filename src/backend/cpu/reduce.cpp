@@ -42,23 +42,13 @@ struct Binary<cdouble, af_add_t> {
 namespace cpu {
 
 template<af_op_t op, typename Ti, typename To>
-using reduce_dim_func = std::function<void(
-    Param<To>, const dim_t, CParam<Ti>, const dim_t, const int, bool, double)>;
-
-template<af_op_t op, typename Ti, typename To>
 Array<To> reduce(const Array<Ti> &in, const int dim, bool change_nan,
                  double nanval) {
     dim4 odims = in.dims();
     odims[dim] = 1;
 
     Array<To> out = createEmptyArray<To>(odims);
-    static const reduce_dim_func<op, Ti, To> reduce_funcs[4] = {
-        kernel::reduce_dim<op, Ti, To, 1>(),
-        kernel::reduce_dim<op, Ti, To, 2>(),
-        kernel::reduce_dim<op, Ti, To, 3>(),
-        kernel::reduce_dim<op, Ti, To, 4>()};
-
-    getQueue().enqueue(reduce_funcs[in.ndims() - 1], out, 0, in, 0, dim,
+    getQueue().enqueue(kernel::reduce_dim_parallel<op, Ti, To>, out, in, dim,
                        change_nan, nanval);
 
     return out;

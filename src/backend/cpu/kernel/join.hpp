@@ -9,6 +9,10 @@
 
 #pragma once
 #include <Param.hpp>
+#include <parallel.hpp>
+
+#include <algorithm>
+#include <cstring>
 
 namespace arrayfire {
 namespace cpu {
@@ -27,22 +31,22 @@ template<typename T>
 void join_append(T *out, const T *X, const af::dim4 &offset,
                  const af::dim4 &xdims, const af::dim4 &ost,
                  const af::dim4 &xst) {
-    for (dim_t ow = 0; ow < xdims[3]; ow++) {
-        const dim_t xW = ow * xst[3];
-        const dim_t oW = (ow + offset[3]) * ost[3];
-
-        for (dim_t oz = 0; oz < xdims[2]; oz++) {
-            const dim_t xZW = xW + oz * xst[2];
-            const dim_t oZW = oW + (oz + offset[2]) * ost[2];
-
-            for (dim_t oy = 0; oy < xdims[1]; oy++) {
-                const dim_t xYZW = xZW + oy * xst[1];
-                const dim_t oYZW = oZW + (oy + offset[1]) * ost[1];
-
-                memcpy(out + oYZW + offset[0], X + xYZW, xdims[0] * sizeof(T));
-            }
-        }
-    }
+    const af::dim4 row_dims(1, xdims[1], xdims[2], xdims[3]);
+    constexpr size_t min_elements_per_task = 1 << 18;
+    const size_t row_elements =
+        std::max<size_t>(1, static_cast<size_t>(xdims[0]));
+    const size_t min_rows_per_task =
+        std::max<size_t>(1, min_elements_per_task / row_elements);
+    parallelForEach(
+        row_dims, min_rows_per_task, [=](dim_t, dim_t oy, dim_t oz, dim_t ow) {
+            const dim_t xW   = ow * xst[3];
+            const dim_t oW   = (ow + offset[3]) * ost[3];
+            const dim_t xZW  = xW + oz * xst[2];
+            const dim_t oZW  = oW + (oz + offset[2]) * ost[2];
+            const dim_t xYZW = xZW + oy * xst[1];
+            const dim_t oYZW = oZW + (oy + offset[1]) * ost[1];
+            std::memcpy(out + oYZW + offset[0], X + xYZW, xdims[0] * sizeof(T));
+        });
 }
 
 template<typename T>
