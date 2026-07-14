@@ -31,7 +31,9 @@ using af::dim4;
 namespace arrayfire {
 namespace oneapi {
 
-void setFFTPlanCacheSize(size_t numPlans) {}
+void setFFTPlanCacheSize(size_t numPlans) {
+    fftManager().setMaxCacheSize(numPlans);
+}
 
 std::string genPlanHashStr(int rank, ::oneapi::mkl::dft::precision precision,
                            ::oneapi::mkl::dft::domain domain,

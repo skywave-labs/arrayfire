@@ -10,6 +10,7 @@
 #include <Array.hpp>
 
 #include <cstddef>
+#include <shared_mutex>
 
 namespace af {
 class dim4;
@@ -17,6 +18,8 @@ class dim4;
 
 namespace arrayfire {
 namespace cpu {
+
+std::shared_mutex &fftwMutex();
 
 void setFFTPlanCacheSize(size_t numPlans);
 
