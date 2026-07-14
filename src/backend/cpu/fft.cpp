@@ -298,7 +298,7 @@ void setFFTPlannerThreadCount(const FFTPrecision precision,
 }
 
 int selectFFTThreadCount(const int rank, const array<int, AF_MAX_DIMS> &dims,
-                         const int batch) {
+                         const int batch, const FFTTransformKind kind) {
     size_t logicalPoints = static_cast<size_t>(std::max(1, batch));
     for (int i = 0; i < rank; ++i) {
         const size_t dimension = static_cast<size_t>(std::max(1, dims[i]));
@@ -309,8 +309,15 @@ int selectFFTThreadCount(const int rank, const array<int, AF_MAX_DIMS> &dims,
         logicalPoints *= dimension;
     }
 
+    // Below the existing large-transform gate, FFTW's C2R plans regress for
+    // some 1D and batched factorizations. C2C and R2C use the gradual ramp.
+    const bool useGradualRamp =
+        kind == FFTTransformKind::C2C || kind == FFTTransformKind::R2C;
+    const detail::FFTPlanThreadPolicy policy =
+        useGradualRamp ? detail::FFTPlanThreadPolicy::GRADUAL
+                       : detail::FFTPlanThreadPolicy::LARGE_ONLY;
     return static_cast<int>(detail::selectFFTPlanThreadCount(
-        logicalPoints, getParallelThreadCount()));
+        logicalPoints, getParallelThreadCount(), policy));
 }
 
 class FFTPlannerThreadGuard {
@@ -373,7 +380,7 @@ FFTPlanKey makePlanKey(const FFTTransformKind kind, const int rank,
     // initialization can reset FFTW state, so it must not happen after plans
     // have entered the process-lifetime cache.
     if (initializeFFTWThreads(precision)) {
-        threadCount = selectFFTThreadCount(rank, dims, batch);
+        threadCount = selectFFTThreadCount(rank, dims, batch, kind);
     }
 #endif
     const int inputAlignment  = fftAlignment(input);

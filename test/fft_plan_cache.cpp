@@ -116,15 +116,40 @@ class Barrier {
 
 }  // namespace
 
-TEST(FFTPlanThreadPolicy, WorkAndConfigurationBounds) {
+TEST(FFTPlanThreadPolicy, GradualC2CAndR2CWorkAndConfigurationBounds) {
+    using arrayfire::cpu::detail::FFTPlanThreadPolicy;
     using arrayfire::cpu::detail::selectFFTPlanThreadCount;
 
-    EXPECT_EQ(1u, selectFFTPlanThreadCount(131072, 9));
-    EXPECT_EQ(1u, selectFFTPlanThreadCount(262143, 9));
-    EXPECT_EQ(2u, selectFFTPlanThreadCount(262144, 2));
-    EXPECT_EQ(4u, selectFFTPlanThreadCount(262144, 9));
-    EXPECT_EQ(4u, selectFFTPlanThreadCount(1u << 24, 64));
-    EXPECT_EQ(1u, selectFFTPlanThreadCount(1u << 24, 1));
+    constexpr auto policy = FFTPlanThreadPolicy::GRADUAL;
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(0, 9, policy));
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(131071, 9, policy));
+    EXPECT_EQ(2u, selectFFTPlanThreadCount(131072, 9, policy));
+    EXPECT_EQ(2u, selectFFTPlanThreadCount(196607, 9, policy));
+    EXPECT_EQ(3u, selectFFTPlanThreadCount(196608, 9, policy));
+    EXPECT_EQ(3u, selectFFTPlanThreadCount(262143, 9, policy));
+    EXPECT_EQ(2u, selectFFTPlanThreadCount(262144, 2, policy));
+    EXPECT_EQ(4u, selectFFTPlanThreadCount(262144, 9, policy));
+    EXPECT_EQ(4u, selectFFTPlanThreadCount(1u << 24, 64, policy));
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(1u << 24, 1, policy));
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(1u << 24, 0, policy));
+}
+
+TEST(FFTPlanThreadPolicy, C2RKeepsLargeOnlyGate) {
+    using arrayfire::cpu::detail::FFTPlanThreadPolicy;
+    using arrayfire::cpu::detail::selectFFTPlanThreadCount;
+
+    constexpr auto policy = FFTPlanThreadPolicy::LARGE_ONLY;
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(131072, 9, policy));
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(262143, 9, policy));
+    EXPECT_EQ(2u, selectFFTPlanThreadCount(262144, 2, policy));
+    EXPECT_EQ(4u, selectFFTPlanThreadCount(262144, 9, policy));
+    EXPECT_EQ(4u, selectFFTPlanThreadCount(1u << 24, 64, policy));
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(1u << 24, 1, policy));
+}
+
+TEST_F(FFTPlanCacheTest, RealRoundTripAcrossMixedThreadPolicies) {
+    checkRealRoundTrip<1>(dim4(131072), f32, 2e-3);
+    checkRealRoundTrip<1>(dim4(131072), f64, 1e-9);
 }
 
 TEST_F(FFTPlanCacheTest, DisabledCache) {
