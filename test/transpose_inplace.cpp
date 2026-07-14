@@ -38,7 +38,7 @@ typedef ::testing::Types<float, cfloat, double, cdouble, int, uint, char, schar,
 TYPED_TEST_SUITE(Transpose, TestTypes);
 
 template<typename T>
-void transposeip_test(dim4 dims) {
+void transposeip_test(dim4 dims, const bool conjugate = false) {
     SUPPORTED_TYPE_CHECK(T);
 
     af_array inArray  = 0;
@@ -47,8 +47,9 @@ void transposeip_test(dim4 dims) {
     ASSERT_SUCCESS(af_randu(&inArray, dims.ndims(), dims.get(),
                             (af_dtype)dtype_traits<T>::af_type));
 
-    ASSERT_SUCCESS(af_transpose(&outArray, inArray, false));
-    ASSERT_SUCCESS(af_transpose_inplace(inArray, false));
+    ASSERT_SUCCESS(af_transpose(&outArray, inArray, conjugate));
+    ASSERT_SUCCESS(af_eval(outArray));
+    ASSERT_SUCCESS(af_transpose_inplace(inArray, conjugate));
 
     ASSERT_ARRAYS_EQ(inArray, outArray);
 
@@ -69,9 +70,37 @@ INIT_TEST(1000, 1, 1);
 INIT_TEST(100, 2, 1);
 INIT_TEST(25, 2, 2);
 
+TEST(TransposeInPlace, ParallelOddBatched) {
+    transposeip_test<float>(dim4(513, 513, 3, 2));
+}
+
+TEST(TransposeInPlace, ParallelConjugateOddBatched) {
+    transposeip_test<cfloat>(dim4(513, 513, 2, 2), true);
+    transposeip_test<cdouble>(dim4(257, 257, 2, 1), true);
+}
+
+TEST(TransposeInPlace, ConjugateSingletonBatches) {
+    transposeip_test<cfloat>(dim4(1, 1, 3, 2), true);
+    transposeip_test<cdouble>(dim4(1, 1, 2, 3), true);
+}
+
+TEST(TransposeInPlace, ManySmallBatches) {
+    transposeip_test<cfloat>(dim4(17, 17, 257, 5), true);
+}
+
+TEST(TransposeInPlace, PaddedOffsetView) {
+    array parent   = randu(dim4(520, 520, 2), c32);
+    array view     = parent(af::seq(3, 515), af::seq(2, 514), af::span);
+    array expected = transpose(view, true);
+
+    transposeInPlace(view, true);
+
+    ASSERT_ARRAYS_EQ(view, expected);
+}
+
 ////////////////////////////////////// CPP //////////////////////////////////
 //
-void transposeInPlaceCPPTest() {
+TEST(TransposeInPlace, CPP) {
     dim4 dims(64, 64, 1, 1);
 
     array input  = randu(dims);
