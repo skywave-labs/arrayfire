@@ -29,37 +29,59 @@ static double cabs(const cdouble &in) { return (double)abs(in); }
 template<af_op_t op, typename T>
 struct MinMaxOp {
     T m_val;
+    double m_key;
     uint m_idx;
-    MinMaxOp(T val, uint idx) : m_val(val), m_idx(idx) {
+    MinMaxOp(T val, uint idx) : m_val(val), m_key(0), m_idx(idx) {
         using arrayfire::cpu::is_nan;
         if (is_nan(val)) { m_val = common::Binary<T, op>::init(); }
+        m_key = cabs(m_val);
     }
 
-    void operator()(T val, uint idx) {
-        if ((cabs(val) < cabs(m_val) ||
-             (cabs(val) == cabs(m_val) && idx > m_idx))) {
-            m_val = val;
-            m_idx = idx;
+    static void update(T &current_val, double &current_key,
+                       uint &current_idx, T val, const double key,
+                       const uint idx) {
+        if (key < current_key ||
+            (key == current_key && idx > current_idx)) {
+            current_val = val;
+            current_key = key;
+            current_idx = idx;
         }
     }
+
+    void consider(T val, const double key, const uint idx) {
+        update(m_val, m_key, m_idx, val, key, idx);
+    }
+
+    void operator()(T val, uint idx) { consider(val, cabs(val), idx); }
 };
 
 template<typename T>
 struct MinMaxOp<af_max_t, T> {
     T m_val;
+    double m_key;
     uint m_idx;
-    MinMaxOp(T val, uint idx) : m_val(val), m_idx(idx) {
+    MinMaxOp(T val, uint idx) : m_val(val), m_key(0), m_idx(idx) {
         using arrayfire::cpu::is_nan;
         if (is_nan(val)) { m_val = common::Binary<T, af_max_t>::init(); }
+        m_key = cabs(m_val);
     }
 
-    void operator()(T val, uint idx) {
-        if ((cabs(val) > cabs(m_val) ||
-             (cabs(val) == cabs(m_val) && idx <= m_idx))) {
-            m_val = val;
-            m_idx = idx;
+    static void update(T &current_val, double &current_key,
+                       uint &current_idx, T val, const double key,
+                       const uint idx) {
+        if (key > current_key ||
+            (key == current_key && idx <= current_idx)) {
+            current_val = val;
+            current_key = key;
+            current_idx = idx;
         }
     }
+
+    void consider(T val, const double key, const uint idx) {
+        update(m_val, m_key, m_idx, val, key, idx);
+    }
+
+    void operator()(T val, uint idx) { consider(val, cabs(val), idx); }
 };
 
 template<af_op_t op, typename T, int D>
