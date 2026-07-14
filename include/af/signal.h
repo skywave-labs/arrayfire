@@ -761,8 +761,8 @@ AFAPI array medfilt2(const array& in, const dim_t wind_length = 3, const dim_t w
 /**
    C++ Interface for setting plan cache size
 
-   This function doesn't do anything if called when CPU backend is active. The plans associated with
-   the most recently used array sizes are cached.
+   The plans associated with the most recently used transform configurations
+   are cached. Setting the cache size to zero disables plan caching.
 
    \param[in] cacheSize is the number of plans that shall be cached
 */
@@ -1600,8 +1600,8 @@ AFAPI af_err af_iir(af_array *y, const af_array b, const af_array a, const af_ar
 /**
    C Interface for setting plan cache size
 
-   This function doesn't do anything if called when CPU backend is active. The plans associated with
-   the most recently used array sizes are cached.
+   The plans associated with the most recently used transform configurations
+   are cached. Setting the cache size to zero disables plan caching.
 
    \param[in] cache_size is the number of plans that shall be cached
 

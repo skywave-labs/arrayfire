@@ -57,6 +57,7 @@ class FFTPlanCache {
 
     // pushes plan to the front of cache(queue)
     void push(const std::string key, plan_t plan) {
+        if (mMaxCacheSize == 0) return;
         if (mCache.size() >= mMaxCacheSize) mCache.pop_back();
 
         mCache.push_front(plan_pair_t(key, plan));
