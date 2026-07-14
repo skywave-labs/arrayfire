@@ -38,15 +38,20 @@ class FFTConvolveLarge : public ::testing::Test {
     virtual void SetUp() {}
 };
 
+template<typename T>
+class FFTConvolveParallelIntegral : public ::testing::Test {};
+
 // create a list of types to be tested
 typedef ::testing::Types<cfloat, cdouble, float, double, int, uint, char, schar,
                          uchar, intl, uintl>
     TestTypes;
 typedef ::testing::Types<float, double> TestTypesLarge;
+typedef ::testing::Types<short, ushort> TestTypesParallelIntegral;
 
 // register the type list
 TYPED_TEST_SUITE(FFTConvolve, TestTypes);
 TYPED_TEST_SUITE(FFTConvolveLarge, TestTypesLarge);
+TYPED_TEST_SUITE(FFTConvolveParallelIntegral, TestTypesParallelIntegral);
 
 template<typename T, int baseDim>
 void fftconvolveTest(string pTestFile, bool expand) {
@@ -107,9 +112,12 @@ void fftconvolveTest(string pTestFile, bool expand) {
 template<typename T, int baseDim>
 void fftconvolveTestLarge(int sDim, int fDim, int sBatch, int fBatch,
                           bool expand) {
+    static_assert(baseDim >= 1 && baseDim <= 3,
+                  "FFT convolution rank must be between 1 and 3");
     SUPPORTED_TYPE_CHECK(T);
 
     using af::seq;
+    using af::span;
 
     int outDim = sDim + fDim - 1;
     int fftDim = (int)pow(2, ceil(log2(outDim)));
@@ -134,8 +142,22 @@ void fftconvolveTestLarge(int sDim, int fDim, int sBatch, int fBatch,
     array signal = randu(signalDims, (af_dtype)dtype_traits<T>::af_type);
     array filter = randu(filterDims, (af_dtype)dtype_traits<T>::af_type);
 
-    array out =
-        fftConvolve(signal, filter, expand ? AF_CONV_EXPAND : AF_CONV_DEFAULT);
+    array out;
+    switch (baseDim) {
+        case 1:
+            out = fftConvolve1(signal, filter,
+                               expand ? AF_CONV_EXPAND : AF_CONV_DEFAULT);
+            break;
+        case 2:
+            out = fftConvolve2(signal, filter,
+                               expand ? AF_CONV_EXPAND : AF_CONV_DEFAULT);
+            break;
+        case 3:
+            out = fftConvolve3(signal, filter,
+                               expand ? AF_CONV_EXPAND : AF_CONV_DEFAULT);
+            break;
+        default: ASSERT_LT(baseDim, 4);
+    }
 
     array gold;
     switch (baseDim) {
@@ -159,17 +181,18 @@ void fftconvolveTestLarge(int sDim, int fDim, int sBatch, int fBatch,
         cropMax = outDim - 1;
     } else {
         cropMin = fDim / 2;
-        cropMax = outDim - fDim / 2 - 1;
+        cropMax = cropMin + sDim - 1;
     }
 
     switch (baseDim) {
-        case 1: gold = gold(seq(cropMin, cropMax)); break;
+        case 1: gold = gold(seq(cropMin, cropMax), span, span, span); break;
         case 2:
-            gold = gold(seq(cropMin, cropMax), seq(cropMin, cropMax));
+            gold = gold(seq(cropMin, cropMax), seq(cropMin, cropMax), span,
+                        span);
             break;
         case 3:
             gold = gold(seq(cropMin, cropMax), seq(cropMin, cropMax),
-                        seq(cropMin, cropMax));
+                        seq(cropMin, cropMax), span);
             break;
     }
 
@@ -221,7 +244,41 @@ TYPED_TEST(FFTConvolveLarge, SameCuboidLargeSignalSmallFilter) {
 }
 
 TYPED_TEST(FFTConvolveLarge, SameCuboidLargeSignalLargeFilter) {
-    fftconvolveTestLarge<TypeParam, 2>(64, 31, 1, 1, false);
+    fftconvolveTestLarge<TypeParam, 3>(64, 31, 1, 1, false);
+}
+
+TYPED_TEST(FFTConvolveLarge, VectorLargeManyToOne) {
+    fftconvolveTestLarge<TypeParam, 1>(65536, 17, 4, 1, true);
+}
+
+TYPED_TEST(FFTConvolveLarge, VectorLargeOneToMany) {
+    fftconvolveTestLarge<TypeParam, 1>(65536, 18, 1, 4, false);
+}
+
+TYPED_TEST(FFTConvolveLarge, VectorLargeManyToMany) {
+    fftconvolveTestLarge<TypeParam, 1>(65536, 17, 4, 4, true);
+}
+
+TYPED_TEST(FFTConvolveLarge, RectangleLargeOneToMany) {
+    fftconvolveTestLarge<TypeParam, 2>(256, 17, 1, 4, false);
+}
+
+TYPED_TEST(FFTConvolveParallelIntegral, OddSignalEvenFilter) {
+    const af_dtype type    = (af_dtype)dtype_traits<TypeParam>::af_type;
+    const array signal     = af::constant(1, dim4(513, 513), type);
+    const array filter     = af::constant(1, dim4(4, 5), type);
+    const array signalCopy = signal.copy();
+    const array filterCopy = filter.copy();
+
+    for (const af_conv_mode mode : {AF_CONV_DEFAULT, AF_CONV_EXPAND}) {
+        const array expected =
+            af::convolve2(signal, filter, mode, AF_CONV_SPATIAL);
+        const array actual = af::fftConvolve2(signal, filter, mode);
+        ASSERT_ARRAYS_EQ(expected, actual);
+    }
+
+    ASSERT_ARRAYS_EQ(signalCopy, signal);
+    ASSERT_ARRAYS_EQ(filterCopy, filter);
 }
 
 TYPED_TEST(FFTConvolve, Vector) {
