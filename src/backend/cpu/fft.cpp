@@ -12,7 +12,9 @@
 #include <Array.hpp>
 #include <copy.hpp>
 #include <err_cpu.hpp>
+#include <fft_threads.hpp>
 #include <fftw3.h>
+#include <parallel.hpp>
 #include <platform.hpp>
 #include <types.hpp>
 #include <af/dim4.hpp>
@@ -20,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -124,6 +127,7 @@ struct FFTPlanKey {
     int rank;
     array<int, AF_MAX_DIMS> dims;
     int batch;
+    int threadCount;
     array<int, AF_MAX_DIMS> inputEmbed;
     array<int, AF_MAX_DIMS> outputEmbed;
     int inputStride;
@@ -139,7 +143,8 @@ struct FFTPlanKey {
     bool operator==(const FFTPlanKey &other) const {
         return precision == other.precision && kind == other.kind &&
                rank == other.rank && dims == other.dims &&
-               batch == other.batch && inputEmbed == other.inputEmbed &&
+               batch == other.batch && threadCount == other.threadCount &&
+               inputEmbed == other.inputEmbed &&
                outputEmbed == other.outputEmbed &&
                inputStride == other.inputStride &&
                inputDistance == other.inputDistance &&
@@ -264,6 +269,74 @@ constexpr FFTPrecision fftPrecision() {
     }
 }
 
+#ifdef AF_WITH_FFTW_THREADS
+
+bool initializeFFTWThreads(const FFTPrecision precision) {
+    if (getParallelThreadCount() <= 1) { return false; }
+
+    if (precision == FFTPrecision::SINGLE) {
+        static const bool initialized = fftwf_init_threads() != 0;
+        return initialized;
+    } else {
+        static const bool initialized = fftw_init_threads() != 0;
+        return initialized;
+    }
+}
+
+int fftPlannerThreadCount(const FFTPrecision precision) {
+    return precision == FFTPrecision::SINGLE ? fftwf_planner_nthreads()
+                                             : fftw_planner_nthreads();
+}
+
+void setFFTPlannerThreadCount(const FFTPrecision precision,
+                              const int threadCount) {
+    if (precision == FFTPrecision::SINGLE) {
+        fftwf_plan_with_nthreads(threadCount);
+    } else {
+        fftw_plan_with_nthreads(threadCount);
+    }
+}
+
+int selectFFTThreadCount(const int rank, const array<int, AF_MAX_DIMS> &dims,
+                         const int batch) {
+    size_t logicalPoints = static_cast<size_t>(std::max(1, batch));
+    for (int i = 0; i < rank; ++i) {
+        const size_t dimension = static_cast<size_t>(std::max(1, dims[i]));
+        if (logicalPoints > std::numeric_limits<size_t>::max() / dimension) {
+            logicalPoints = std::numeric_limits<size_t>::max();
+            break;
+        }
+        logicalPoints *= dimension;
+    }
+
+    return static_cast<int>(detail::selectFFTPlanThreadCount(
+        logicalPoints, getParallelThreadCount()));
+}
+
+class FFTPlannerThreadGuard {
+   public:
+    FFTPlannerThreadGuard(const FFTPrecision precision, const int threadCount)
+        : precision_(precision), active_(initializeFFTWThreads(precision)) {
+        if (active_) {
+            previousThreadCount_ = fftPlannerThreadCount(precision_);
+            setFFTPlannerThreadCount(precision_, threadCount);
+        }
+    }
+
+    ~FFTPlannerThreadGuard() {
+        if (active_) {
+            setFFTPlannerThreadCount(precision_, previousThreadCount_);
+        }
+    }
+
+   private:
+    FFTPrecision precision_;
+    int previousThreadCount_ = 1;
+    bool active_;
+};
+
+#endif
+
 template<typename T>
 int fftAlignment(const T *ptr) {
 #ifdef USE_MKL
@@ -293,14 +366,25 @@ FFTPlanKey makePlanKey(const FFTTransformKind kind, const int rank,
                        const int direction, const unsigned flags,
                        const Ti *input, const To *output) {
     std::unique_lock<std::shared_mutex> fftwLock(fftwMutex());
+    const FFTPrecision precision = fftPrecision<Ti>();
+    int threadCount              = 1;
+#ifdef AF_WITH_FFTW_THREADS
+    // Initialize before the first FFTW operation of each precision. A failed
+    // initialization can reset FFTW state, so it must not happen after plans
+    // have entered the process-lifetime cache.
+    if (initializeFFTWThreads(precision)) {
+        threadCount = selectFFTThreadCount(rank, dims, batch);
+    }
+#endif
     const int inputAlignment  = fftAlignment(input);
     const int outputAlignment = fftAlignment(output);
     return FFTPlanKey{
-        fftPrecision<Ti>(),
+        precision,
         kind,
         rank,
         dims,
         batch,
+        threadCount,
         inputEmbed,
         outputEmbed,
         inputStride,
@@ -325,6 +409,12 @@ std::shared_ptr<FFTPlan> getFFTPlan(const FFTPlanKey &key, Creator &&create) {
     return fftPlanCache().getOrCreate(
         key,
         [&]() {
+#ifdef AF_WITH_FFTW_THREADS
+            // FFTW's planner count is process-global and sticky. Install the
+            // plan-specific value only while the exclusive planner lock is
+            // held, then restore the host application's prior setting.
+            FFTPlannerThreadGuard threadGuard(key.precision, key.threadCount);
+#endif
             return reinterpret_cast<void *>(std::forward<Creator>(create)());
         },
         &destroyFFTPlan<Transform>);
@@ -366,9 +456,8 @@ void fft_inplace(Param<T> in, const af::dim4 iDataDims, const int rank,
     int batch = 1;
     for (int i = rank; i < 4; i++) { batch *= idims[i]; }
 
-    const int fftwDirection = direction ? FFTW_FORWARD : FFTW_BACKWARD;
-    constexpr unsigned flags =
-        FFTW_ESTIMATE;  // NOLINT(hicpp-signed-bitwise)
+    const int fftwDirection  = direction ? FFTW_FORWARD : FFTW_BACKWARD;
+    constexpr unsigned flags = FFTW_ESTIMATE;  // NOLINT(hicpp-signed-bitwise)
     const auto key = makePlanKey(FFTTransformKind::C2C, rank, t_dims, batch,
                                  in_embed, static_cast<int>(istrides[0]),
                                  static_cast<int>(istrides[rank]), in_embed,
@@ -378,9 +467,9 @@ void fft_inplace(Param<T> in, const af::dim4 iDataDims, const int rank,
 
     auto plan = getFFTPlan<fftw_transform<T>>(key, [&]() {
         return transform.create(
-            rank, t_dims.data(), batch,
-            reinterpret_cast<ctype_t *>(in.get()), in_embed.data(),
-            static_cast<int>(istrides[0]), static_cast<int>(istrides[rank]),
+            rank, t_dims.data(), batch, reinterpret_cast<ctype_t *>(in.get()),
+            in_embed.data(), static_cast<int>(istrides[0]),
+            static_cast<int>(istrides[rank]),
             reinterpret_cast<ctype_t *>(in.get()), in_embed.data(),
             static_cast<int>(istrides[0]), static_cast<int>(istrides[rank]),
             fftwDirection, flags);
@@ -514,9 +603,9 @@ Array<Tr> fft_c2r(const Array<Tc> &in, const dim4 &odims, const int rank) {
     return out;
 }
 
-#define INSTANTIATE(T)                                                      \
-    template void fft_inplace<T>(Param<T>, const af::dim4, const int,       \
-                                 const bool);                               \
+#define INSTANTIATE(T)                                                \
+    template void fft_inplace<T>(Param<T>, const af::dim4, const int, \
+                                 const bool);                         \
     template void fft_inplace<T>(Array<T> &, const int, const bool);
 
 INSTANTIATE(cfloat)

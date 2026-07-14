@@ -233,10 +233,16 @@ AF_CPU_NUM_THREADS {#af_cpu_num_threads}
 -------------------------------------------------------------------------------
 
 When set to a positive integer, this environment variable limits the number of
-threads used by each element-wise JIT evaluation in the CPU backend. The value
-is capped at the number of hardware threads reported by the operating system.
-The default is to use all available hardware threads for sufficiently large
+threads used by parallel kernels in the CPU backend. The value is capped at the
+number of hardware threads reported by the operating system. The default is to
+use all available hardware threads for sufficiently large element-wise JIT
 expressions; expressions smaller than 65,536 elements remain single-threaded.
+
+Native FFTW builds with compatible FFTW thread support also use this limit for
+large FFTs. Transforms smaller than 262,144 logical points remain
+single-threaded; larger transforms use at most four threads. Other native FFTW
+builds remain single-threaded for FFTs, while MKL builds use MKL's runtime
+threading controls.
 
 AF_BUILD_LIB_CUSTOM_PATH {#af_build_lib_custom_path}
 -------------------------------------------------------------------------------

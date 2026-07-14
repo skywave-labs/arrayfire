@@ -63,6 +63,7 @@ target_sources(afcpu
     fast.hpp
     fft.cpp
     fft.hpp
+    fft_threads.hpp
     fftconvolve.cpp
     fftconvolve.hpp
     flood_fill.hpp
@@ -332,12 +333,21 @@ if(BUILD_WITH_MKL)
       target_link_libraries(afcpu PRIVATE MKL::RT)
   endif()
 else()
-  target_link_libraries(afcpu
-    PRIVATE
-      ${CBLAS_LIBRARIES}
-      FFTW::FFTW
-      FFTW::FFTWF
-    )
+  target_link_libraries(afcpu PRIVATE ${CBLAS_LIBRARIES})
+  if(FFTW_THREADS_FOUND)
+    target_compile_definitions(afcpu PRIVATE AF_WITH_FFTW_THREADS)
+    target_link_libraries(afcpu
+      PRIVATE
+        FFTW::FFTW_THREADS
+        FFTW::FFTWF_THREADS
+      )
+  else()
+    target_link_libraries(afcpu
+      PRIVATE
+        FFTW::FFTW
+        FFTW::FFTWF
+      )
+  endif()
   if(LAPACK_FOUND AND LAPACKE_FOUND)
     target_link_libraries(afcpu PRIVATE LAPACKE::LAPACKE ${LAPACK_LIBRARIES})
   endif()
