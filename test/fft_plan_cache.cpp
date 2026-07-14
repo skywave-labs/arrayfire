@@ -9,6 +9,7 @@
 
 #include <arrayfire.h>
 #include <gtest/gtest.h>
+#include <src/backend/cpu/fft_threads.hpp>
 #include <testHelpers.hpp>
 
 #include <cmath>
@@ -115,6 +116,17 @@ class Barrier {
 
 }  // namespace
 
+TEST(FFTPlanThreadPolicy, WorkAndConfigurationBounds) {
+    using arrayfire::cpu::detail::selectFFTPlanThreadCount;
+
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(131072, 9));
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(262143, 9));
+    EXPECT_EQ(2u, selectFFTPlanThreadCount(262144, 2));
+    EXPECT_EQ(4u, selectFFTPlanThreadCount(262144, 9));
+    EXPECT_EQ(4u, selectFFTPlanThreadCount(1u << 24, 64));
+    EXPECT_EQ(1u, selectFFTPlanThreadCount(1u << 24, 1));
+}
+
 TEST_F(FFTPlanCacheTest, DisabledCache) {
     ASSERT_SUCCESS(af_set_fft_plan_cache_size(0));
     af::setFFTPlanCacheSize(0);
@@ -189,8 +201,8 @@ TEST_F(FFTPlanCacheTest, FFTConvolveSamePlanDifferentPackedBuffers) {
 
     const array firstExpected =
         convolve2(firstSignal, firstFilter, AF_CONV_DEFAULT, AF_CONV_SPATIAL);
-    const array secondExpected = convolve2(secondSignal, secondFilter,
-                                           AF_CONV_DEFAULT, AF_CONV_SPATIAL);
+    const array secondExpected =
+        convolve2(secondSignal, secondFilter, AF_CONV_DEFAULT, AF_CONV_SPATIAL);
     firstExpected.eval();
     secondExpected.eval();
     af::sync();
@@ -237,6 +249,27 @@ TEST_F(FFTPlanCacheTest, EvictionResizeAndBatchedKeys) {
     af::setFFTPlanCacheSize(1);
     af::setFFTPlanCacheSize(0);
     ASSERT_ARRAYS_NEAR(first, complexRoundTrip(first, 1), 1e-3);
+}
+
+TEST_F(FFTPlanCacheTest, ThreadedPlanGateAcrossTransformKinds) {
+    af::setFFTPlanCacheSize(8);
+
+    // Exercise a serial cache miss before and after threaded-sized plans. FFTW
+    // keeps its planner thread count globally, so both transitions matter.
+    const array smallFirst = randu(dim4(127, 3), c32);
+    ASSERT_ARRAYS_NEAR(smallFirst, complexRoundTrip(smallFirst, 1), 1e-3);
+
+    const array largeComplex = randu(dim4(512, 512), c32);
+    ASSERT_ARRAYS_NEAR(largeComplex, complexRoundTrip(largeComplex, 2), 3e-3);
+
+    const array batchedDouble = randu(dim4(4096, 64), c64);
+    ASSERT_ARRAYS_NEAR(batchedDouble, complexRoundTrip(batchedDouble, 1), 1e-9);
+
+    checkRealRoundTrip<2>(dim4(512, 512), f32, 2e-3);
+    checkRealRoundTrip<2>(dim4(512, 512), f64, 1e-9);
+
+    const array smallLast = randu(dim4(131, 2), c64);
+    ASSERT_ARRAYS_NEAR(smallLast, complexRoundTrip(smallLast, 1), 1e-10);
 }
 
 TEST_F(FFTPlanCacheTest, AlignmentAndEmbeddingKeys) {
@@ -324,6 +357,67 @@ TEST_F(FFTPlanCacheTest, ConcurrentColdMissReuseAndResize) {
 
     for (auto &worker : workers) { worker.join(); }
     resizer.join();
+
+    for (size_t i = 0; i < errors.size(); ++i) {
+        if (errors[i]) {
+            try {
+                std::rethrow_exception(errors[i]);
+            } catch (const std::exception &error) {
+                FAIL() << "worker " << i << " failed: " << error.what();
+            } catch (...) { FAIL() << "worker " << i << " failed"; }
+        }
+    }
+
+    for (size_t i = 0; i < workerCount; ++i) {
+        for (size_t j = 0; j < elements; ++j) {
+            const float realError = expected[i][j].real - output[i][j].real;
+            const float imagError = expected[i][j].imag - output[i][j].imag;
+            ASSERT_NEAR(std::hypot(realError, imagError), 0.0, 3e-3)
+                << "worker " << i << ", element " << j;
+        }
+    }
+}
+
+TEST_F(FFTPlanCacheTest, ConcurrentThreadedPlanReuse) {
+    constexpr size_t workerCount = 3;
+    constexpr int iterations     = 2;
+    const dim4 dims(512, 512);
+    const size_t elements = static_cast<size_t>(dims.elements());
+
+    vector<array> inputs;
+    vector<vector<cfloat>> expected(workerCount, vector<cfloat>(elements));
+    vector<vector<cfloat>> output(workerCount, vector<cfloat>(elements));
+    vector<std::exception_ptr> errors(workerCount);
+    inputs.reserve(workerCount);
+    for (size_t i = 0; i < workerCount; ++i) {
+        inputs.emplace_back(randu(dims, c32));
+        inputs.back().eval();
+    }
+    af::sync();
+    for (size_t i = 0; i < workerCount; ++i) {
+        inputs[i].host(expected[i].data());
+    }
+
+    af::setFFTPlanCacheSize(0);
+    af::setFFTPlanCacheSize(2);
+    Barrier barrier(workerCount);
+    vector<std::thread> workers;
+    workers.reserve(workerCount);
+    for (size_t i = 0; i < workerCount; ++i) {
+        workers.emplace_back([&, i]() {
+            try {
+                af::setDevice(0);
+                array value = inputs[i].copy();
+                barrier.wait();
+                for (int j = 0; j < iterations; ++j) {
+                    fft2InPlace(value);
+                    ifft2InPlace(value);
+                }
+                value.host(output[i].data());
+            } catch (...) { errors[i] = std::current_exception(); }
+        });
+    }
+    for (auto &worker : workers) { worker.join(); }
 
     for (size_t i = 0; i < errors.size(); ++i) {
         if (errors[i]) {
