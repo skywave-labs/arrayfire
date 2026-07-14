@@ -239,10 +239,13 @@ use all available hardware threads for sufficiently large element-wise JIT
 expressions; expressions smaller than 65,536 elements remain single-threaded.
 
 Native FFTW builds with compatible FFTW thread support also use this limit for
-large FFTs. Transforms smaller than 262,144 logical points remain
-single-threaded; larger transforms use at most four threads. Other native FFTW
-builds remain single-threaded for FFTs, while MKL builds use MKL's runtime
-threading controls.
+large FFTs. Complex-to-complex and real-to-complex plan teams grow gradually
+with transform work: transforms smaller than 131,072 logical points remain
+single-threaded, then one thread is added per 65,536 points up to a maximum of
+four threads at 262,144 points. Complex-to-real transforms retain the
+conservative 262,144-point threading gate. The configured limit is always
+respected. Other native FFTW builds remain single-threaded for FFTs, while MKL
+builds use MKL's runtime threading controls.
 
 AF_BUILD_LIB_CUSTOM_PATH {#af_build_lib_custom_path}
 -------------------------------------------------------------------------------
