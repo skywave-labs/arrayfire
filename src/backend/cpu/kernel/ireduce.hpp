@@ -11,6 +11,7 @@
 #include <Param.hpp>
 #include <common/Binary.hpp>
 #include <common/half.hpp>
+#include <parallel.hpp>
 #include <algorithm>
 #include <cmath>
 
@@ -124,6 +125,33 @@ struct ireduce_dim<op, T, 0> {
         loc[outOffset] = Op.m_idx;
     }
 };
+
+template<af_op_t op, typename T>
+void ireduce_dim_parallel(Param<T> output, Param<uint> locParam,
+                          CParam<T> input, const int dim,
+                          CParam<uint> rlen) {
+    const af::dim4 odims    = output.dims();
+    const af::dim4 ostrides = output.strides();
+    const af::dim4 idims    = input.dims();
+    const af::dim4 istrides = input.strides();
+    const size_t reduced_elements =
+        std::max<size_t>(1, static_cast<size_t>(idims[dim]));
+
+    constexpr size_t min_input_elements_per_task = 1 << 16;
+    const size_t min_lines_per_task =
+        std::max<size_t>(1, min_input_elements_per_task / reduced_elements);
+    // Keep each line's scalar fold intact so value/index tie rules are exact.
+    parallelForEach(
+        odims, min_lines_per_task, [=](dim_t x, dim_t y, dim_t z, dim_t w) {
+            const dim_t out_offset = x * ostrides[0] + y * ostrides[1] +
+                                     z * ostrides[2] + w * ostrides[3];
+            const dim_t in_offset = x * istrides[0] + y * istrides[1] +
+                                    z * istrides[2] + w * istrides[3];
+            ireduce_dim<op, T, 0> reduce_line;
+            reduce_line(output, locParam, out_offset, input, in_offset, dim,
+                        rlen);
+        });
+}
 
 }  // namespace kernel
 }  // namespace cpu
