@@ -276,6 +276,8 @@ target_sources(afcpu
     kernel/transpose.hpp
     kernel/transpose_avx2.cpp
     kernel/transpose_avx2.hpp
+    kernel/transpose_neon.cpp
+    kernel/transpose_neon.hpp
     kernel/triangle.hpp
     kernel/unwrap.hpp
     kernel/wrap.hpp
