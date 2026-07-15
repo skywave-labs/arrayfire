@@ -255,6 +255,8 @@ target_sources(afcpu
     kernel/random_engine_threefry.hpp
     kernel/range.hpp
     kernel/reduce.hpp
+    kernel/reduce_dim_avx2.cpp
+    kernel/reduce_dim_avx2.hpp
     kernel/regions.hpp
     kernel/reorder.hpp
     kernel/resize.hpp
@@ -301,6 +303,7 @@ endif()
 if(AF_CPU_MSVC_X86)
   set_source_files_properties(
     kernel/gradient_avx2.cpp
+    kernel/reduce_dim_avx2.cpp
     kernel/transpose_avx2.cpp
     PROPERTIES
       COMPILE_DEFINITIONS AF_CPU_COMPILE_AVX2

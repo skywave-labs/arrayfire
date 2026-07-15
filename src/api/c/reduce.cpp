@@ -761,14 +761,16 @@ static af_err reduce_all_promote(double *real_val, double *imag_val,
                 }
             } break;
             case c32:
-                cfval = reduce_all<op, cfloat, cfloat, cfloat>(in);
+                cfval = reduce_all<op, cfloat, cfloat, cfloat>(in, change_nan,
+                                                               nanval);
                 ARG_ASSERT(1, imag_val != nullptr);
                 *real_val = real(cfval);
                 *imag_val = imag(cfval);
                 break;
 
             case c64:
-                cdval = reduce_all<op, cdouble, cdouble, cdouble>(in);
+                cdval = reduce_all<op, cdouble, cdouble, cdouble>(
+                    in, change_nan, nanval);
                 ARG_ASSERT(1, imag_val != nullptr);
                 *real_val = real(cdval);
                 *imag_val = imag(cdval);
