@@ -45,6 +45,20 @@ void reduceDimProductRangeAVX2(Param<double> out, CParam<double> in, int dim,
                                bool change_nan, double nanval,
                                size_t tile_begin, size_t tile_end) noexcept;
 
+void reduceDimMinRangeAVX2(Param<float> out, CParam<float> in, int dim,
+                           bool change_nan, double nanval, size_t tile_begin,
+                           size_t tile_end) noexcept;
+void reduceDimMinRangeAVX2(Param<double> out, CParam<double> in, int dim,
+                           bool change_nan, double nanval, size_t tile_begin,
+                           size_t tile_end) noexcept;
+
+void reduceDimMaxRangeAVX2(Param<float> out, CParam<float> in, int dim,
+                           bool change_nan, double nanval, size_t tile_begin,
+                           size_t tile_end) noexcept;
+void reduceDimMaxRangeAVX2(Param<double> out, CParam<double> in, int dim,
+                           bool change_nan, double nanval, size_t tile_begin,
+                           size_t tile_end) noexcept;
+
 }  // namespace detail
 }  // namespace kernel
 }  // namespace cpu

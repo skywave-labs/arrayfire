@@ -385,6 +385,92 @@ void checkDimensionalProduct(const dim_t width, const int dim) {
     expectBitwiseEqual(expected, actual);
 }
 
+template<typename T>
+T extremaPattern(const size_t line, const dim_t reducedIndex) {
+    const T infinity = std::numeric_limits<T>::infinity();
+    const T nan      = std::numeric_limits<T>::quiet_NaN();
+    switch (line % 7) {
+        case 0:
+            if (reducedIndex == dimensionalReduceLength - 1) {
+                return (line & 1) ? T(0) : -T(0);
+            }
+            return (line & 1) ? -T(0) : T(0);
+        case 1:
+            if (reducedIndex == 0 || reducedIndex == 31 ||
+                reducedIndex == dimensionalReduceLength - 1) {
+                return nan;
+            }
+            return static_cast<T>(static_cast<int>((line + reducedIndex) % 13) -
+                                  6);
+        case 2:
+            if (reducedIndex == 3) { return -infinity; }
+            if (reducedIndex == 201) { return infinity; }
+            return static_cast<T>(static_cast<int>(reducedIndex % 9) - 4);
+        case 3: return T(7.25);
+        case 4:
+            return static_cast<T>(static_cast<int>((3 * line + reducedIndex) %
+                                                   23) -
+                                  11) /
+                   T(8);
+        case 5: return nan;
+        default:
+            return (reducedIndex & 1) ? -std::numeric_limits<T>::denorm_min()
+                                      : std::numeric_limits<T>::denorm_min();
+    }
+}
+
+template<typename T>
+void checkDimensionalExtrema(const dim_t width, const int dim) {
+    const dim4 dims = dimensionalReduceDims(width, dim);
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<T> input(static_cast<size_t>(dims.elements()));
+    vector<T> expectedMin(static_cast<size_t>(outputDims.elements()));
+    vector<T> expectedMax(static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        linearIndex(outputDims, x, y, z, w);
+                    T minValue = std::numeric_limits<T>::infinity();
+                    T maxValue = -std::numeric_limits<T>::infinity();
+                    for (dim_t r = 0; r < dims[dim]; ++r) {
+                        coords[dim]        = r;
+                        const T inputValue = extremaPattern<T>(outputIndex, r);
+                        input[linearIndex(dims, coords[0], coords[1], coords[2],
+                                          coords[3])] = inputValue;
+                        const T minInput =
+                            std::isnan(inputValue)
+                                ? std::numeric_limits<T>::infinity()
+                                : inputValue;
+                        const T maxInput =
+                            std::isnan(inputValue)
+                                ? -std::numeric_limits<T>::infinity()
+                                : inputValue;
+                        minValue = std::min(minInput, minValue);
+                        maxValue = std::max(maxInput, maxValue);
+                    }
+                    expectedMin[outputIndex] = minValue;
+                    expectedMax[outputIndex] = maxValue;
+                }
+            }
+        }
+    }
+
+    const array inputArray(dims, input.data());
+    const array minOutput = af::min(inputArray, dim);
+    const array maxOutput = af::max(inputArray, dim);
+    vector<T> actualMin(expectedMin.size());
+    vector<T> actualMax(expectedMax.size());
+    minOutput.host(actualMin.data());
+    maxOutput.host(actualMax.data());
+    expectBitwiseEqual(expectedMin, actualMin);
+    expectBitwiseEqual(expectedMax, actualMax);
+}
+
 void checkGappedDimensionalSum(const int dim) {
     const dim4 dims = dimensionalReduceDims(35, dim);
     dim4 parentDims = dims;
@@ -433,6 +519,69 @@ void checkGappedDimensionalSum(const int dim) {
 }
 
 template<typename T>
+void checkGappedDimensionalExtrema(const dim_t width, const int dim) {
+    const dim4 dims = dimensionalReduceDims(width, dim);
+    dim4 parentDims = dims;
+    parentDims[dim] += 2;
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<T> input(static_cast<size_t>(parentDims.elements()), T(91));
+    vector<T> expectedMin(static_cast<size_t>(outputDims.elements()));
+    vector<T> expectedMax(static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        linearIndex(outputDims, x, y, z, w);
+                    T minValue = std::numeric_limits<T>::infinity();
+                    T maxValue = -std::numeric_limits<T>::infinity();
+                    for (dim_t r = 0; r < dims[dim]; ++r) {
+                        coords[dim]        = r + 1;
+                        const T inputValue = extremaPattern<T>(outputIndex, r);
+                        input[linearIndex(parentDims, coords[0], coords[1],
+                                          coords[2], coords[3])] = inputValue;
+                        const T minInput =
+                            std::isnan(inputValue)
+                                ? std::numeric_limits<T>::infinity()
+                                : inputValue;
+                        const T maxInput =
+                            std::isnan(inputValue)
+                                ? -std::numeric_limits<T>::infinity()
+                                : inputValue;
+                        minValue = std::min(minInput, minValue);
+                        maxValue = std::max(maxInput, maxValue);
+                    }
+                    expectedMin[outputIndex] = minValue;
+                    expectedMax[outputIndex] = maxValue;
+                }
+            }
+        }
+    }
+
+    const array parent(parentDims, input.data());
+    array view;
+    if (dim == 1) {
+        view = parent(span, seq(1, dimensionalReduceLength), span, span);
+    } else if (dim == 2) {
+        view = parent(span, span, seq(1, dimensionalReduceLength), span);
+    } else {
+        view = parent(span, span, span, seq(1, dimensionalReduceLength));
+    }
+
+    const array minOutput = af::min(view, dim);
+    const array maxOutput = af::max(view, dim);
+    vector<T> actualMin(expectedMin.size());
+    vector<T> actualMax(expectedMax.size());
+    minOutput.host(actualMin.data());
+    maxOutput.host(actualMax.data());
+    expectBitwiseEqual(expectedMin, actualMin);
+    expectBitwiseEqual(expectedMax, actualMax);
+}
+
+template<typename T>
 void checkSumWidths(const dim_t *widths, const size_t count) {
     for (int dim = 1; dim <= 3; ++dim) {
         for (size_t i = 0; i < count; ++i) {
@@ -450,6 +599,17 @@ void checkProductWidths(const dim_t *widths, const size_t count) {
             SCOPED_TRACE(::testing::Message()
                          << "dimension " << dim << ", width " << widths[i]);
             checkDimensionalProduct<T>(widths[i], dim);
+        }
+    }
+}
+
+template<typename T>
+void checkExtremaWidths(const dim_t *widths, const size_t count) {
+    for (int dim = 1; dim <= 3; ++dim) {
+        for (size_t i = 0; i < count; ++i) {
+            SCOPED_TRACE(::testing::Message()
+                         << "dimension " << dim << ", width " << widths[i]);
+            checkDimensionalExtrema<T>(widths[i], dim);
         }
     }
 }
@@ -662,11 +822,25 @@ TEST(ReduceDimExactCpu, ProductF64PreservesScalarFold) {
     checkProductWidths<double>(widths, sizeof(widths) / sizeof(widths[0]));
 }
 
+TEST(ReduceDimExactCpu, MinMaxF32PreserveScalarFold) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    const dim_t widths[] = {7, 8, 9, 31, 32, 35};
+    checkExtremaWidths<float>(widths, sizeof(widths) / sizeof(widths[0]));
+}
+
+TEST(ReduceDimExactCpu, MinMaxF64PreserveScalarFold) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    const dim_t widths[] = {3, 4, 5, 15, 16, 19};
+    checkExtremaWidths<double>(widths, sizeof(widths) / sizeof(widths[0]));
+}
+
 TEST(ReduceDimExactCpu, GappedSubarraysPreserveScalarFold) {
     SKIP_IF_FAST_MATH_ENABLED();
     for (int dim = 1; dim <= 3; ++dim) {
         SCOPED_TRACE(::testing::Message() << "dimension " << dim);
         checkGappedDimensionalSum(dim);
+        checkGappedDimensionalExtrema<float>(35, dim);
+        checkGappedDimensionalExtrema<double>(19, dim);
     }
 }
 
