@@ -9,10 +9,12 @@
 
 #include <arrayfire.h>
 #include <gtest/gtest.h>
+#include <half.hpp>
 #include <testHelpers.hpp>
 #include <af/internal.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <vector>
@@ -28,11 +30,49 @@ namespace {
 
 constexpr size_t blockElements    = 1 << 16;
 constexpr size_t parallelElements = 9 * blockElements;
+// Eight worker-sized input grains regardless of the reduced dimension.
+const dim4 dimensionalDims(256, 32, 16, 4);
 
 size_t linearIndex(const dim4 &dims, const dim_t x, const dim_t y,
                    const dim_t z, const dim_t w) {
     return static_cast<size_t>(
         x + dims[0] * (y + dims[1] * (z + dims[2] * w)));
+}
+
+size_t lineElementIndex(const dim4 &dims, const int dim, const size_t line,
+                        const dim_t reducedIndex) {
+    dim4 odims = dims;
+    odims[dim] = 1;
+
+    size_t remaining = line;
+    std::array<dim_t, 4> coord;
+    for (int axis = 0; axis < 4; ++axis) {
+        coord[axis] = static_cast<dim_t>(
+            remaining % static_cast<size_t>(odims[axis]));
+        remaining /= static_cast<size_t>(odims[axis]);
+    }
+    coord[dim] = reducedIndex;
+    return linearIndex(dims, coord[0], coord[1], coord[2], coord[3]);
+}
+
+array makeGappedView(const array &dense) {
+    const dim4 dims = dense.dims();
+    const dim4 parentDims(dims[0] + 2, dims[1] + 2, dims[2] + 2,
+                          dims[3] + 2);
+    array parent = af::constant(0, parentDims, dense.type());
+    const seq x(1, dims[0]);
+    const seq y(1, dims[1]);
+    const seq z(1, dims[2]);
+    const seq w(1, dims[3]);
+    parent(x, y, z, w) = dense;
+    return parent(x, y, z, w);
+}
+
+template<typename T>
+vector<T> hostVector(const array &input) {
+    vector<T> result(input.elements());
+    input.host(result.data());
+    return result;
 }
 
 void expectComplexEqual(const cfloat expected, const cfloat actual) {
@@ -302,4 +342,313 @@ TEST(IReduceAllParallel, BooleanKeysPreserveRawCharPayloads) {
     EXPECT_EQ(parallelElements - 1, static_cast<size_t>(minIndex));
     EXPECT_EQ(2, maxValue);
     EXPECT_EQ(0u, maxIndex);
+}
+
+TEST(IReduceDimParallel, GappedTiesPreserveIndicesAcrossAllDimensions) {
+    for (int dim = 0; dim < 4; ++dim) {
+        const dim_t reducedElements = dimensionalDims[dim];
+        const size_t lineCount = static_cast<size_t>(
+            dimensionalDims.elements() / reducedElements);
+        vector<float> values(dimensionalDims.elements(), 1.f);
+
+        for (size_t line = 0; line < lineCount; ++line) {
+            values[lineElementIndex(dimensionalDims, dim, line, 0)] = 9.f;
+            values[lineElementIndex(dimensionalDims, dim, line,
+                                    reducedElements - 2)] = 9.f;
+            values[lineElementIndex(dimensionalDims, dim, line, 1)] = -7.f;
+            values[lineElementIndex(dimensionalDims, dim, line,
+                                    reducedElements - 1)] = -7.f;
+        }
+
+        const array input = makeGappedView(array(dimensionalDims,
+                                                 values.data()));
+        const dim4 strides = af::getStrides(input);
+        ASSERT_EQ(1, strides[0]);
+        ASSERT_EQ(dimensionalDims[0] + 2, strides[1]);
+
+        array minValues;
+        array minIndices;
+        array maxValues;
+        array maxIndices;
+        af::min(minValues, minIndices, input, dim);
+        af::max(maxValues, maxIndices, input, dim);
+
+        const vector<float> hostMinValues = hostVector<float>(minValues);
+        const vector<unsigned> hostMinIndices =
+            hostVector<unsigned>(minIndices);
+        const vector<float> hostMaxValues = hostVector<float>(maxValues);
+        const vector<unsigned> hostMaxIndices =
+            hostVector<unsigned>(maxIndices);
+        ASSERT_EQ(lineCount, hostMinValues.size());
+        ASSERT_EQ(lineCount, hostMaxValues.size());
+        for (size_t line = 0; line < lineCount; ++line) {
+            EXPECT_EQ(-7.f, hostMinValues[line]);
+            EXPECT_EQ(static_cast<unsigned>(reducedElements - 1),
+                      hostMinIndices[line]);
+            EXPECT_EQ(9.f, hostMaxValues[line]);
+            EXPECT_EQ(0u, hostMaxIndices[line]);
+        }
+    }
+}
+
+TEST(IReduceDimParallel, RealSpecialValuesPreserveScalarSemantics) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    const int dim               = 0;
+    const dim_t reducedElements = dimensionalDims[dim];
+    const size_t lineCount      = static_cast<size_t>(
+        dimensionalDims.elements() / reducedElements);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    vector<float> minInput(dimensionalDims.elements(), 2.f);
+    vector<float> maxInput(dimensionalDims.elements(), -2.f);
+
+    for (size_t line = 0; line < lineCount; ++line) {
+        if (line % 3 == 0) {
+            minInput[lineElementIndex(dimensionalDims, dim, line, 1)] = 0.f;
+            minInput[lineElementIndex(dimensionalDims, dim, line,
+                                      reducedElements - 1)] = -0.f;
+            maxInput[lineElementIndex(dimensionalDims, dim, line, 1)] = -0.f;
+            maxInput[lineElementIndex(dimensionalDims, dim, line,
+                                      reducedElements - 1)] = 0.f;
+        } else if (line % 3 == 1) {
+            for (dim_t reduced = 0; reduced < reducedElements; ++reduced) {
+                minInput[lineElementIndex(dimensionalDims, dim, line,
+                                          reduced)] = nan;
+                maxInput[lineElementIndex(dimensionalDims, dim, line,
+                                          reduced)] = nan;
+            }
+        } else {
+            minInput[lineElementIndex(dimensionalDims, dim, line, 0)] = nan;
+            maxInput[lineElementIndex(dimensionalDims, dim, line, 0)] = nan;
+            minInput[lineElementIndex(dimensionalDims, dim, line, 5)] = -1.f;
+            maxInput[lineElementIndex(dimensionalDims, dim, line, 5)] = 1.f;
+        }
+    }
+
+    array minValues;
+    array minIndices;
+    array maxValues;
+    array maxIndices;
+    af::min(minValues, minIndices,
+            array(dimensionalDims, minInput.data()), dim);
+    af::max(maxValues, maxIndices,
+            array(dimensionalDims, maxInput.data()), dim);
+
+    const vector<float> hostMinValues = hostVector<float>(minValues);
+    const vector<unsigned> hostMinIndices =
+        hostVector<unsigned>(minIndices);
+    const vector<float> hostMaxValues = hostVector<float>(maxValues);
+    const vector<unsigned> hostMaxIndices =
+        hostVector<unsigned>(maxIndices);
+    for (size_t line = 0; line < lineCount; ++line) {
+        if (line % 3 == 0) {
+            EXPECT_EQ(0.f, hostMinValues[line]);
+            EXPECT_TRUE(std::signbit(hostMinValues[line]));
+            EXPECT_EQ(static_cast<unsigned>(reducedElements - 1),
+                      hostMinIndices[line]);
+            EXPECT_EQ(0.f, hostMaxValues[line]);
+            EXPECT_TRUE(std::signbit(hostMaxValues[line]));
+            EXPECT_EQ(1u, hostMaxIndices[line]);
+        } else if (line % 3 == 1) {
+            EXPECT_TRUE(std::isinf(hostMinValues[line]));
+            EXPECT_GT(hostMinValues[line], 0.f);
+            EXPECT_EQ(0u, hostMinIndices[line]);
+            EXPECT_TRUE(std::isinf(hostMaxValues[line]));
+            EXPECT_LT(hostMaxValues[line], 0.f);
+            EXPECT_EQ(0u, hostMaxIndices[line]);
+        } else {
+            EXPECT_EQ(-1.f, hostMinValues[line]);
+            EXPECT_EQ(5u, hostMinIndices[line]);
+            EXPECT_EQ(1.f, hostMaxValues[line]);
+            EXPECT_EQ(5u, hostMaxIndices[line]);
+        }
+    }
+}
+
+TEST(IReduceDimParallel, ComplexKeysPreserveTiesAndRawNaNEvents) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    const int dim               = 0;
+    const dim_t reducedElements = dimensionalDims[dim];
+    const size_t lineCount      = static_cast<size_t>(
+        dimensionalDims.elements() / reducedElements);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    const cfloat ordinaryNaN(nan, 0.f);
+    const cfloat rawEvent(inf, nan);
+    vector<cfloat> minInput(dimensionalDims.elements(), cfloat(3.f, 0.f));
+    vector<cfloat> maxInput(dimensionalDims.elements(), cfloat(.25f, 0.f));
+
+    for (size_t line = 0; line < lineCount; ++line) {
+        minInput[lineElementIndex(dimensionalDims, dim, line, 1)] =
+            cfloat(1.f, 0.f);
+        minInput[lineElementIndex(dimensionalDims, dim, line,
+                                  reducedElements - 1)] = cfloat(0.f, -1.f);
+        maxInput[lineElementIndex(dimensionalDims, dim, line, 1)] =
+            cfloat(4.f, 0.f);
+        maxInput[lineElementIndex(dimensionalDims, dim, line,
+                                  reducedElements - 1)] = cfloat(0.f, 4.f);
+    }
+
+    for (size_t line = 0; line < 2; ++line) {
+        for (dim_t reduced = 0; reduced < reducedElements; ++reduced) {
+            minInput[lineElementIndex(dimensionalDims, dim, line, reduced)] =
+                ordinaryNaN;
+            maxInput[lineElementIndex(dimensionalDims, dim, line, reduced)] =
+                ordinaryNaN;
+        }
+    }
+    minInput[lineElementIndex(dimensionalDims, dim, 0, 0)] = rawEvent;
+    maxInput[lineElementIndex(dimensionalDims, dim, 0, 0)] = rawEvent;
+    minInput[lineElementIndex(dimensionalDims, dim, 1, 7)] = rawEvent;
+    maxInput[lineElementIndex(dimensionalDims, dim, 1, 7)] = rawEvent;
+
+    array minValues;
+    array minIndices;
+    array maxValues;
+    array maxIndices;
+    af::min(minValues, minIndices,
+            array(dimensionalDims, minInput.data()), dim);
+    af::max(maxValues, maxIndices,
+            array(dimensionalDims, maxInput.data()), dim);
+
+    const vector<cfloat> hostMinValues = hostVector<cfloat>(minValues);
+    const vector<unsigned> hostMinIndices =
+        hostVector<unsigned>(minIndices);
+    const vector<cfloat> hostMaxValues = hostVector<cfloat>(maxValues);
+    const vector<unsigned> hostMaxIndices =
+        hostVector<unsigned>(maxIndices);
+    EXPECT_TRUE(std::isinf(af::real(hostMinValues[0])));
+    EXPECT_GT(af::real(hostMinValues[0]), 0.f);
+    EXPECT_EQ(0.f, af::imag(hostMinValues[0]));
+    EXPECT_EQ(0u, hostMinIndices[0]);
+    expectRawInfNaN(hostMaxValues[0]);
+    EXPECT_EQ(0u, hostMaxIndices[0]);
+    expectRawInfNaN(hostMinValues[1]);
+    EXPECT_EQ(7u, hostMinIndices[1]);
+    expectRawInfNaN(hostMaxValues[1]);
+    EXPECT_EQ(7u, hostMaxIndices[1]);
+
+    for (size_t line = 2; line < lineCount; ++line) {
+        expectComplexEqual(cfloat(0.f, -1.f), hostMinValues[line]);
+        EXPECT_EQ(static_cast<unsigned>(reducedElements - 1),
+                  hostMinIndices[line]);
+        expectComplexEqual(cfloat(4.f, 0.f), hostMaxValues[line]);
+        EXPECT_EQ(1u, hostMaxIndices[line]);
+    }
+}
+
+TEST(IReduceDimParallel, TypeSpecificKeysPreserveRawPayloads) {
+    const dim4 dims(256, 512);
+    const dim_t reducedElements = dims[0];
+    const size_t lineCount = static_cast<size_t>(dims[1]);
+    const unsigned long long twoTo53 = 9007199254740992ULL;
+    vector<unsigned long long> minU64(dims.elements(), twoTo53 + 1024);
+    vector<unsigned long long> maxU64(dims.elements(), 0);
+    vector<char> booleanValues(dims.elements(), 1);
+    vector<half_float::half> halfValues(dims.elements(),
+                                        half_float::half(0.f));
+
+    for (size_t line = 0; line < lineCount; ++line) {
+        minU64[lineElementIndex(dims, 0, line, 7)] = twoTo53;
+        minU64[lineElementIndex(dims, 0, line,
+                                reducedElements - 1)] = twoTo53 + 1;
+        maxU64[lineElementIndex(dims, 0, line, 7)] = twoTo53;
+        maxU64[lineElementIndex(dims, 0, line,
+                                reducedElements - 1)] = twoTo53 + 1;
+        booleanValues[lineElementIndex(dims, 0, line, 0)] = 2;
+        booleanValues[lineElementIndex(dims, 0, line,
+                                       reducedElements - 1)] = 3;
+        halfValues[lineElementIndex(dims, 0, line, 0)] =
+            half_float::half(9.f);
+        halfValues[lineElementIndex(dims, 0, line,
+                                    reducedElements - 2)] =
+            half_float::half(9.f);
+        halfValues[lineElementIndex(dims, 0, line, 1)] =
+            half_float::half(-7.f);
+        halfValues[lineElementIndex(dims, 0, line,
+                                    reducedElements - 1)] =
+            half_float::half(-7.f);
+    }
+
+    array minValues;
+    array minIndices;
+    array maxValues;
+    array maxIndices;
+    af::min(minValues, minIndices, array(dims, minU64.data()), 0);
+    af::max(maxValues, maxIndices, array(dims, maxU64.data()), 0);
+    const vector<unsigned long long> hostMinU64 =
+        hostVector<unsigned long long>(minValues);
+    const vector<unsigned> hostMinU64Indices =
+        hostVector<unsigned>(minIndices);
+    const vector<unsigned long long> hostMaxU64 =
+        hostVector<unsigned long long>(maxValues);
+    const vector<unsigned> hostMaxU64Indices =
+        hostVector<unsigned>(maxIndices);
+    for (size_t line = 0; line < lineCount; ++line) {
+        EXPECT_EQ(twoTo53 + 1, hostMinU64[line]);
+        EXPECT_EQ(static_cast<unsigned>(reducedElements - 1),
+                  hostMinU64Indices[line]);
+        EXPECT_EQ(twoTo53, hostMaxU64[line]);
+        EXPECT_EQ(7u, hostMaxU64Indices[line]);
+    }
+
+    af::min(minValues, minIndices, array(dims, booleanValues.data()), 0);
+    af::max(maxValues, maxIndices, array(dims, booleanValues.data()), 0);
+    const vector<char> hostMinBoolean = hostVector<char>(minValues);
+    const vector<unsigned> hostMinBooleanIndices =
+        hostVector<unsigned>(minIndices);
+    const vector<char> hostMaxBoolean = hostVector<char>(maxValues);
+    const vector<unsigned> hostMaxBooleanIndices =
+        hostVector<unsigned>(maxIndices);
+    for (size_t line = 0; line < lineCount; ++line) {
+        EXPECT_EQ(3, hostMinBoolean[line]);
+        EXPECT_EQ(static_cast<unsigned>(reducedElements - 1),
+                  hostMinBooleanIndices[line]);
+        EXPECT_EQ(2, hostMaxBoolean[line]);
+        EXPECT_EQ(0u, hostMaxBooleanIndices[line]);
+    }
+
+    af::min(minValues, minIndices, array(dims, halfValues.data()), 0);
+    af::max(maxValues, maxIndices, array(dims, halfValues.data()), 0);
+    const vector<half_float::half> hostMinHalf =
+        hostVector<half_float::half>(minValues);
+    const vector<unsigned> hostMinHalfIndices =
+        hostVector<unsigned>(minIndices);
+    const vector<half_float::half> hostMaxHalf =
+        hostVector<half_float::half>(maxValues);
+    const vector<unsigned> hostMaxHalfIndices =
+        hostVector<unsigned>(maxIndices);
+    for (size_t line = 0; line < lineCount; ++line) {
+        EXPECT_EQ(-7.f, static_cast<float>(hostMinHalf[line]));
+        EXPECT_EQ(static_cast<unsigned>(reducedElements - 1),
+                  hostMinHalfIndices[line]);
+        EXPECT_EQ(9.f, static_cast<float>(hostMaxHalf[line]));
+        EXPECT_EQ(0u, hostMaxHalfIndices[line]);
+    }
+}
+
+TEST(IReduceDimParallel, EvaluatesLargeLazyInputBeforeWorkerReads) {
+    const int dim = 2;
+    const array lazy = af::range(dimensionalDims, dim) * -2.f + 5.f;
+    array minValues;
+    array minIndices;
+    array maxValues;
+    array maxIndices;
+    af::min(minValues, minIndices, lazy, dim);
+    af::max(maxValues, maxIndices, lazy, dim);
+
+    const vector<float> hostMinValues = hostVector<float>(minValues);
+    const vector<unsigned> hostMinIndices =
+        hostVector<unsigned>(minIndices);
+    const vector<float> hostMaxValues = hostVector<float>(maxValues);
+    const vector<unsigned> hostMaxIndices =
+        hostVector<unsigned>(maxIndices);
+    const float expectedMin =
+        5.f - 2.f * static_cast<float>(dimensionalDims[dim] - 1);
+    for (size_t line = 0; line < hostMinValues.size(); ++line) {
+        EXPECT_EQ(expectedMin, hostMinValues[line]);
+        EXPECT_EQ(static_cast<unsigned>(dimensionalDims[dim] - 1),
+                  hostMinIndices[line]);
+        EXPECT_EQ(5.f, hostMaxValues[line]);
+        EXPECT_EQ(0u, hostMaxIndices[line]);
+    }
 }

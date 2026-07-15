@@ -30,6 +30,16 @@ namespace arrayfire {
 namespace cpu {
 namespace {
 
+// Require at least two full worker tasks before paying dispatch overhead.
+constexpr size_t min_parallel_dimensional_elements = 1 << 17;
+
+bool shouldParallelizeDimensionalIReduce(const dim4 &idims,
+                                         const dim4 &odims) {
+    return static_cast<size_t>(idims.elements()) >=
+               min_parallel_dimensional_elements &&
+           odims.elements() > 1 && getParallelThreadCount() > 1;
+}
+
 template<typename T>
 struct IndexedPartial {
     T value{};
@@ -121,8 +131,13 @@ void ireduce(Array<T> &out, Array<uint> &loc, const Array<T> &in,
         kernel::ireduce_dim<op, T, 1>(), kernel::ireduce_dim<op, T, 2>(),
         kernel::ireduce_dim<op, T, 3>(), kernel::ireduce_dim<op, T, 4>()};
 
-    getQueue().enqueue(ireduce_funcs[in.ndims() - 1], out, loc, 0, in, 0, dim,
-                       rlen);
+    if (shouldParallelizeDimensionalIReduce(in.dims(), odims)) {
+        getQueue().enqueue(kernel::ireduce_dim_parallel<op, T>, out, loc, in,
+                           dim, rlen);
+    } else {
+        getQueue().enqueue(ireduce_funcs[in.ndims() - 1], out, loc, 0, in, 0,
+                           dim, rlen);
+    }
 }
 
 template<af_op_t op, typename T>
