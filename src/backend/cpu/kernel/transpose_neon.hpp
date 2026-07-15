@@ -25,8 +25,9 @@ bool isTransposeNEONCompiled() noexcept;
 // This function may only be called after isTransposeNEONCompiled() returns
 // true. The input and output pointers may be unaligned. Strides are measured
 // in elements and x strides must be one. Each tile is 8x8; consecutive tiles
-// advance along the input tile-x direction. Conjugation is supported for 8-
-// and 16-byte complex elements; callers must pass false for 4-byte elements.
+// advance along the input tile-x direction. The implementation supports 4-
+// and 8-byte elements. Conjugation is supported for 8-byte complex elements;
+// callers must pass false for 4-byte elements.
 void transposeTileRunNEON(void *output, const void *input,
                           dim_t output_y_stride, dim_t input_y_stride,
                           size_t tile_count, size_t element_size,

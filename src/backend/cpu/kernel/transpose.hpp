@@ -45,7 +45,13 @@ namespace detail {
 static_assert(sizeof(cfloat) == 2 * sizeof(float));
 static_assert(sizeof(cdouble) == 2 * sizeof(double));
 
-enum class TransposeKernel { SCALAR, AVX2, NEON };
+#if defined(AF_CPU_COMPILE_NEON_TRANSPOSE) && defined(__aarch64__) && \
+    (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#define AF_CPU_NEON_TRANSPOSE_TARGET
+enum class TransposeKernel { SCALAR, NEON };
+#else
+using TransposeKernel = bool;
+#endif
 
 template<typename T>
 constexpr bool isVectorizedTransposeType =
@@ -60,14 +66,23 @@ TransposeKernel selectTransposeKernel(dim_t output_x_stride,
                                       dim_t input_x_stride) {
     if constexpr (isVectorizedTransposeType<T>) {
         if (output_x_stride == 1 && input_x_stride == 1) {
+#if defined(AF_CPU_NEON_TRANSPOSE_TARGET)
+            if constexpr (sizeof(T) < 16) {
+                if (isTransposeNEONCompiled()) { return TransposeKernel::NEON; }
+            }
+#else
             if (arrayfire::cpu::detail::isAVX2Supported() &&
                 isTransposeAVX2Compiled()) {
-                return TransposeKernel::AVX2;
+                return true;
             }
-            if (isTransposeNEONCompiled()) { return TransposeKernel::NEON; }
+#endif
         }
     }
+#if defined(AF_CPU_NEON_TRANSPOSE_TARGET)
     return TransposeKernel::SCALAR;
+#else
+    return false;
+#endif
 }
 
 }  // namespace detail
@@ -99,15 +114,13 @@ void transpose_tile_run(T *output, const T *input, dim_t output_x_stride,
                         dim_t input_y_stride, size_t tile_count,
                         detail::TransposeKernel transpose_kernel) {
     if constexpr (detail::isVectorizedTransposeType<T>) {
-        if (transpose_kernel == detail::TransposeKernel::AVX2) {
-            constexpr bool conjugate_values =
-                conjugate && common::is_complex<T>::value;
-            detail::transposeTileRunAVX2(output, input, output_y_stride,
-                                         input_y_stride, tile_count, sizeof(T),
-                                         conjugate_values);
-            return;
-        }
-        if (transpose_kernel == detail::TransposeKernel::NEON) {
+#if defined(AF_CPU_NEON_TRANSPOSE_TARGET)
+        // Amortize the out-of-line dispatcher and shuffle setup. Narrow runs
+        // stay on the inlined scalar tile until native measurements justify a
+        // lower architecture-specific threshold.
+        constexpr size_t min_neon_tiles = 4;
+        if (transpose_kernel == detail::TransposeKernel::NEON &&
+            tile_count >= min_neon_tiles) {
             constexpr bool conjugate_values =
                 conjugate && common::is_complex<T>::value;
             detail::transposeTileRunNEON(output, input, output_y_stride,
@@ -115,6 +128,16 @@ void transpose_tile_run(T *output, const T *input, dim_t output_x_stride,
                                          conjugate_values);
             return;
         }
+#else
+        if (transpose_kernel) {
+            constexpr bool conjugate_values =
+                conjugate && common::is_complex<T>::value;
+            detail::transposeTileRunAVX2(output, input, output_y_stride,
+                                         input_y_stride, tile_count, sizeof(T),
+                                         conjugate_values);
+            return;
+        }
+#endif
     }
 
     constexpr dim_t tile_size = 8;
@@ -566,3 +589,5 @@ void transpose_inplace(Param<T> in, const bool conjugate) {
 }  // namespace kernel
 }  // namespace cpu
 }  // namespace arrayfire
+
+#undef AF_CPU_NEON_TRANSPOSE_TARGET
