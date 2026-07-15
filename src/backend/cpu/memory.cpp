@@ -19,6 +19,12 @@
 #include <types.hpp>
 #include <af/dim4.hpp>
 
+#include <cstdlib>
+#ifdef _WIN32
+#include <malloc.h>
+#include <mutex>
+#include <unordered_set>
+#endif
 #include <utility>
 
 using af::dim4;
@@ -30,6 +36,23 @@ using std::unique_ptr;
 
 namespace arrayfire {
 namespace cpu {
+#ifdef _WIN32
+namespace {
+struct AlignedAllocationRegistry {
+    std::mutex mutex;
+    std::unordered_set<void *> pointers;
+};
+
+AlignedAllocationRegistry &alignedAllocationRegistry() {
+    // Custom memory managers may forward malloc-owned pointers to nativeFree.
+    // Keep this registry alive across allocator replacement so only pointers
+    // owned by _aligned_malloc are passed to _aligned_free.
+    static auto *registry = new AlignedAllocationRegistry();
+    return *registry;
+}
+}  // namespace
+#endif
+
 float getMemoryPressure() { return memoryManager().getMemoryPressure(); }
 float getMemoryPressureThreshold() {
     return memoryManager().getMemoryPressureThreshold();
@@ -144,7 +167,24 @@ size_t Allocator::getMaxMemorySize(int id) {
 }
 
 void *Allocator::nativeAlloc(const size_t bytes) {
-    void *ptr = malloc(bytes);  // NOLINT(hicpp-no-malloc)
+    void *ptr = nullptr;
+#ifdef _WIN32
+    ptr = _aligned_malloc(bytes, kDefaultMemoryAlignment);
+    if (ptr) {
+        try {
+            auto &registry = alignedAllocationRegistry();
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            registry.pointers.insert(ptr);
+        } catch (...) {
+            _aligned_free(ptr);
+            throw;
+        }
+    }
+#else
+    if (posix_memalign(&ptr, kDefaultMemoryAlignment, bytes) != 0) {
+        ptr = nullptr;
+    }
+#endif
     AF_TRACE("nativeAlloc: {:>7} {}", bytesToString(bytes), ptr);
     if (!ptr) { AF_ERROR("Unable to allocate memory", AF_ERR_NO_MEM); }
     return ptr;
@@ -155,7 +195,21 @@ void Allocator::nativeFree(void *ptr) {
     // Make sure this pointer is not being used on the queue before freeing the
     // memory.
     getQueue().sync();
+#ifdef _WIN32
+    bool aligned = false;
+    {
+        auto &registry = alignedAllocationRegistry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        aligned = registry.pointers.erase(ptr) != 0;
+    }
+    if (aligned) {
+        _aligned_free(ptr);
+    } else {
+        free(ptr);  // NOLINT(hicpp-no-malloc)
+    }
+#else
     free(ptr);  // NOLINT(hicpp-no-malloc)
+#endif
 }
 }  // namespace cpu
 }  // namespace arrayfire
