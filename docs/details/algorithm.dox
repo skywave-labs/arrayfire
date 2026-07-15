@@ -16,6 +16,11 @@ This function runs across all batches in the input simultaneously.
 
 Sum array elements over a given dimension.
 
+Floating-point addition is not associative. Reduction order is implementation
+dependent and may vary across backends, architectures, thread configurations,
+and ArrayFire versions. Floating-point and complex results are therefore not
+guaranteed to be bitwise reproducible across those configurations.
+
 This table defines output types for corresponding input types:
 
 Input Type          | Output Type
@@ -69,6 +74,12 @@ dimension. An example of multi-dimensional reduce-by-key can be seen below:
 \ingroup reduce_mat
 
 Multiply array elements over a given dimension.
+
+Floating-point multiplication is not associative. Reduction order is
+implementation dependent and may vary across backends, architectures, thread
+configurations, and ArrayFire versions. Floating-point and complex results are
+therefore not guaranteed to be bitwise reproducible across those
+configurations.
 
 This table defines output types for corresponding input types:
 

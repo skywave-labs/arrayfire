@@ -12,15 +12,124 @@
 #include <common/Binary.hpp>
 #include <common/Transform.hpp>
 #include <common/half.hpp>
+#include <cpu_features.hpp>
+#include <kernel/reduce_dim_avx2.hpp>
 #include <parallel.hpp>
 
 #include <algorithm>
 #include <array>
+#include <limits>
+#include <type_traits>
 #include <vector>
+
+#if defined(_MSC_VER)
+#define AF_CPU_REDUCE_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define AF_CPU_REDUCE_NOINLINE __attribute__((noinline))
+#else
+#define AF_CPU_REDUCE_NOINLINE
+#endif
 
 namespace arrayfire {
 namespace cpu {
 namespace kernel {
+
+namespace detail {
+
+template<typename T>
+constexpr bool isAVX2SumType =
+    std::is_same<T, float>::value || std::is_same<T, double>::value ||
+    std::is_same<T, cfloat>::value || std::is_same<T, cdouble>::value;
+
+template<typename T>
+constexpr bool isAVX2ProductType =
+    std::is_same<T, float>::value || std::is_same<T, double>::value;
+
+template<af_op_t op, typename Ti, typename To>
+constexpr bool isAVX2ReduceSupported =
+    (op == af_add_t && std::is_same<Ti, To>::value && isAVX2SumType<Ti>) ||
+    (op == af_mul_t && std::is_same<Ti, To>::value && isAVX2ProductType<Ti>);
+
+template<af_op_t op, typename Ti, typename To>
+AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
+    Param<To> out, CParam<Ti> in, const int dim, bool change_nan, double nanval,
+    const af::dim4 &odims, const af::dim4 &ostrides, const af::dim4 &idims,
+    const af::dim4 &istrides) {
+    constexpr bool supported_sum =
+        op == af_add_t && std::is_same<Ti, To>::value && isAVX2SumType<Ti>;
+    constexpr bool supported_product =
+        op == af_mul_t && std::is_same<Ti, To>::value && isAVX2ProductType<Ti>;
+
+    if constexpr (!supported_sum && !supported_product) {
+        return false;
+    } else {
+        constexpr size_t vector_bytes             = 32;
+        constexpr size_t tile_bytes               = 128;
+        constexpr size_t vector_elements          = vector_bytes / sizeof(Ti);
+        constexpr size_t tile_elements            = tile_bytes / sizeof(Ti);
+        constexpr size_t min_input_elements       = 1U << 12U;
+        constexpr size_t target_elements_per_task = 1U << 16U;
+
+        if (dim < 1 || dim > 3 ||
+            odims[0] < static_cast<dim_t>(vector_elements) || idims[dim] < 2 ||
+            istrides[0] != 1 || ostrides[0] != 1) {
+            return false;
+        }
+
+        if (static_cast<size_t>(idims.elements()) < min_input_elements) {
+            return false;
+        }
+
+        if (!arrayfire::cpu::detail::isAVX2Supported() ||
+            !isReduceDimAVX2Compiled()) {
+            return false;
+        }
+
+        const size_t width            = static_cast<size_t>(odims[0]);
+        const size_t reduced_elements = static_cast<size_t>(idims[dim]);
+
+        const size_t x_tiles = 1 + (width - 1) / tile_elements;
+        size_t row_count     = 1;
+        for (int axis = 1; axis < 4; ++axis) {
+            const size_t axis_elements = static_cast<size_t>(odims[axis]);
+            if (axis_elements != 0 &&
+                row_count >
+                    std::numeric_limits<size_t>::max() / axis_elements) {
+                return false;
+            }
+            row_count *= axis_elements;
+        }
+        if (row_count > std::numeric_limits<size_t>::max() / x_tiles) {
+            return false;
+        }
+        const size_t tile_count = x_tiles * row_count;
+
+        const size_t work_per_tile =
+            reduced_elements >
+                    std::numeric_limits<size_t>::max() / tile_elements
+                ? std::numeric_limits<size_t>::max()
+                : reduced_elements * tile_elements;
+        const size_t min_tiles_per_task =
+            work_per_tile >= target_elements_per_task
+                ? 1
+                : 1 + (target_elements_per_task - 1) / work_per_tile;
+
+        parallelForRange(tile_count, min_tiles_per_task,
+                         [=](const size_t begin, const size_t end) {
+                             if constexpr (supported_sum) {
+                                 reduceDimSumRangeAVX2(out, in, dim, change_nan,
+                                                       nanval, begin, end);
+                             } else {
+                                 reduceDimProductRangeAVX2(out, in, dim,
+                                                           change_nan, nanval,
+                                                           begin, end);
+                             }
+                         });
+        return true;
+    }
+}
+
+}  // namespace detail
 
 template<af_op_t op, typename Ti, typename To, int D>
 struct reduce_dim {
@@ -72,9 +181,18 @@ void reduce_dim_parallel(Param<To> out, CParam<Ti> in, const int dim,
                          bool change_nan, double nanval) {
     const af::dim4 odims    = out.dims();
     const af::dim4 ostrides = out.strides();
+    const af::dim4 idims    = in.dims();
     const af::dim4 istrides = in.strides();
+    if constexpr (detail::isAVX2ReduceSupported<op, Ti, To>) {
+        if (detail::tryReduceDimAVX2<op, Ti, To>(out, in, dim, change_nan,
+                                                 nanval, odims, ostrides, idims,
+                                                 istrides)) {
+            return;
+        }
+    }
+
     const size_t reduced_elements =
-        std::max<size_t>(1, static_cast<size_t>(in.dims()[dim]));
+        std::max<size_t>(1, static_cast<size_t>(idims[dim]));
 
     constexpr size_t min_input_elements_per_task = 1 << 16;
     const size_t min_lines_per_task =
@@ -348,3 +466,5 @@ struct reduce_all {
 }  // namespace kernel
 }  // namespace cpu
 }  // namespace arrayfire
+
+#undef AF_CPU_REDUCE_NOINLINE
