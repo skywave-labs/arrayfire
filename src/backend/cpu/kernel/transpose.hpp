@@ -9,11 +9,15 @@
 
 #pragma once
 #include <Param.hpp>
+#include <common/complex.hpp>
+#include <cpu_features.hpp>
 #include <err_cpu.hpp>
+#include <kernel/transpose_avx2.hpp>
 #include <parallel.hpp>
 #include <utility.hpp>
 
 #include <algorithm>
+#include <type_traits>
 
 namespace arrayfire {
 namespace cpu {
@@ -35,20 +39,74 @@ cdouble getConjugate(const cdouble &in) {
     return std::conj(in);
 }
 
+namespace detail {
+
+template<typename T>
+constexpr bool isAVX2TransposeType =
+    (std::is_same<T, float>::value || std::is_same<T, double>::value ||
+     std::is_same<T, int>::value || std::is_same<T, uint>::value ||
+     std::is_same<T, intl>::value || std::is_same<T, uintl>::value ||
+     std::is_same<T, cfloat>::value || std::is_same<T, cdouble>::value) &&
+    (sizeof(T) == 4 || sizeof(T) == 8 || sizeof(T) == 16);
+
+template<typename T>
+bool canUseTransposeAVX2(dim_t output_x_stride, dim_t input_x_stride) {
+    if constexpr (isAVX2TransposeType<T>) {
+        return output_x_stride == 1 && input_x_stride == 1 &&
+               arrayfire::cpu::detail::isAVX2Supported() &&
+               isTransposeAVX2Compiled();
+    }
+    return false;
+}
+
+}  // namespace detail
+
 template<typename T, bool conjugate>
-void transpose_tile(T *output, const T *input, dim_t output_y_stride,
-                    dim_t input_y_stride) {
+void transpose_tile_scalar(T *output, const T *input, dim_t output_x_stride,
+                           dim_t output_y_stride, dim_t input_x_stride,
+                           dim_t input_y_stride) {
     constexpr int tile_size = 8;
     for (int x = 0; x < tile_size; ++x) {
         for (int y = 0; y < tile_size; ++y) {
             if constexpr (conjugate) {
-                output[y * output_y_stride] = getConjugate(input[y]);
+                output[y * output_y_stride] =
+                    getConjugate(input[y * input_x_stride]);
             } else {
-                output[y * output_y_stride] = input[y];
+                output[y * output_y_stride] = input[y * input_x_stride];
             }
         }
-        input += input_y_stride;
-        ++output;
+        if (x + 1 < tile_size) {
+            input += input_y_stride;
+            output += output_x_stride;
+        }
+    }
+}
+
+template<typename T, bool conjugate>
+void transpose_tile_run(T *output, const T *input, dim_t output_x_stride,
+                        dim_t output_y_stride, dim_t input_x_stride,
+                        dim_t input_y_stride, size_t tile_count,
+                        bool use_avx2) {
+    if constexpr (detail::isAVX2TransposeType<T>) {
+        if (use_avx2) {
+            constexpr bool conjugate_values =
+                conjugate && common::is_complex<T>::value;
+            detail::transposeTileRunAVX2(output, input, output_y_stride,
+                                         input_y_stride, tile_count, sizeof(T),
+                                         conjugate_values);
+            return;
+        }
+    }
+
+    constexpr dim_t tile_size = 8;
+    for (size_t tile = 0; tile < tile_count; ++tile) {
+        transpose_tile_scalar<T, conjugate>(output, input, output_x_stride,
+                                            output_y_stride, input_x_stride,
+                                            input_y_stride);
+        if (tile + 1 < tile_count) {
+            output += tile_size * output_x_stride;
+            input += tile_size * input_y_stride;
+        }
     }
 }
 
@@ -61,14 +119,33 @@ void transpose_out(Param<T> output, CParam<T> input) {
     T *const out      = output.get();
     const T *const in = input.get();
 
+    const dim_t output_width  = odims[0];
+    const dim_t output_height = odims[1];
+    const dim_t depth         = odims[2];
+    const dim_t batches       = odims[3];
+
+    const dim_t output_x_stride = ostrides[0];
+    const dim_t output_y_stride = ostrides[1];
+    const dim_t output_z_stride = ostrides[2];
+    const dim_t output_w_stride = ostrides[3];
+    const dim_t input_x_stride  = istrides[0];
+    const dim_t input_y_stride  = istrides[1];
+    const dim_t input_z_stride  = istrides[2];
+    const dim_t input_w_stride  = istrides[3];
+
     constexpr size_t tile_size = 8;
     const size_t x_tiles =
-        (static_cast<size_t>(odims[0]) + tile_size - 1) / tile_size;
+        (static_cast<size_t>(output_width) + tile_size - 1) / tile_size;
     const size_t y_tiles =
-        (static_cast<size_t>(odims[1]) + tile_size - 1) / tile_size;
-    const size_t tile_count = x_tiles * y_tiles *
-                              static_cast<size_t>(odims[2]) *
-                              static_cast<size_t>(odims[3]);
+        (static_cast<size_t>(output_height) + tile_size - 1) / tile_size;
+    const size_t full_x_tiles = static_cast<size_t>(output_width) / tile_size;
+    const size_t tile_count   = x_tiles * y_tiles * static_cast<size_t>(depth) *
+                              static_cast<size_t>(batches);
+
+    const bool use_avx2 =
+        detail::canUseTransposeAVX2<T>(output_x_stride, input_x_stride);
+    const bool all_tiles_full =
+        output_width % tile_size == 0 && output_height % tile_size == 0;
 
     constexpr size_t min_elements_per_task = 1 << 16;
     constexpr size_t tile_elements         = tile_size * tile_size;
@@ -81,96 +158,115 @@ void transpose_out(Param<T> output, CParam<T> input) {
             linear /= x_tiles;
             size_t tile_y = linear % y_tiles;
             linear /= y_tiles;
-            dim_t z = static_cast<dim_t>(linear % odims[2]);
-            dim_t w = static_cast<dim_t>(linear / odims[2]);
+            dim_t z = static_cast<dim_t>(linear % depth);
+            dim_t w = static_cast<dim_t>(linear / depth);
 
-            if (odims[0] % tile_size == 0 && odims[1] % tile_size == 0) {
-                const dim_t input_tile_stride  = tile_size * istrides[1];
-                const dim_t output_tile_stride = tile_size * ostrides[0];
+            if (all_tiles_full) {
                 const T *tile_input =
-                    in + static_cast<dim_t>(tile_y * tile_size) * istrides[0] +
-                    static_cast<dim_t>(tile_x * tile_size) * istrides[1] +
-                    z * istrides[2] + w * istrides[3];
+                    in +
+                    static_cast<dim_t>(tile_y * tile_size) * input_x_stride +
+                    static_cast<dim_t>(tile_x * tile_size) * input_y_stride +
+                    z * input_z_stride + w * input_w_stride;
                 T *tile_output =
-                    out + static_cast<dim_t>(tile_x * tile_size) * ostrides[0] +
-                    static_cast<dim_t>(tile_y * tile_size) * ostrides[1] +
-                    z * ostrides[2] + w * ostrides[3];
+                    out +
+                    static_cast<dim_t>(tile_x * tile_size) * output_x_stride +
+                    static_cast<dim_t>(tile_y * tile_size) * output_y_stride +
+                    z * output_z_stride + w * output_w_stride;
 
-                for (size_t tile = begin; tile < end; ++tile) {
-                    transpose_tile<T, conjugate>(tile_output, tile_input,
-                                                 ostrides[1], istrides[1]);
-                    if (++tile_x < x_tiles) {
-                        tile_input += input_tile_stride;
-                        tile_output += output_tile_stride;
+                size_t tile = begin;
+                while (tile < end) {
+                    const size_t run = std::min(end - tile, x_tiles - tile_x);
+                    transpose_tile_run<T, conjugate>(
+                        tile_output, tile_input, output_x_stride,
+                        output_y_stride, input_x_stride, input_y_stride, run,
+                        use_avx2);
+                    tile += run;
+                    tile_x += run;
+                    if (tile == end) { break; }
+                    if (tile_x < x_tiles) {
+                        tile_input += static_cast<dim_t>(run * tile_size) *
+                                      input_y_stride;
+                        tile_output += static_cast<dim_t>(run * tile_size) *
+                                       output_x_stride;
                         continue;
                     }
 
                     tile_x = 0;
                     if (++tile_y == y_tiles) {
                         tile_y = 0;
-                        if (++z == odims[2]) {
+                        if (++z == depth) {
                             z = 0;
                             ++w;
                         }
                     }
-                    tile_input =
-                        in +
-                        static_cast<dim_t>(tile_y * tile_size) * istrides[0] +
-                        z * istrides[2] + w * istrides[3];
-                    tile_output =
-                        out +
-                        static_cast<dim_t>(tile_y * tile_size) * ostrides[1] +
-                        z * ostrides[2] + w * ostrides[3];
+                    tile_input = in +
+                                 static_cast<dim_t>(tile_y * tile_size) *
+                                     input_x_stride +
+                                 z * input_z_stride + w * input_w_stride;
+                    tile_output = out +
+                                  static_cast<dim_t>(tile_y * tile_size) *
+                                      output_y_stride +
+                                  z * output_z_stride + w * output_w_stride;
                 }
                 return;
             }
 
-            for (size_t tile = begin; tile < end; ++tile) {
+            size_t tile = begin;
+            while (tile < end) {
                 const dim_t x_begin = static_cast<dim_t>(tile_x * tile_size);
                 const dim_t y_begin = static_cast<dim_t>(tile_y * tile_size);
                 const dim_t x_end =
-                    std::min<dim_t>(odims[0], x_begin + tile_size);
+                    std::min<dim_t>(output_width, x_begin + tile_size);
                 const dim_t y_end =
-                    std::min<dim_t>(odims[1], y_begin + tile_size);
+                    std::min<dim_t>(output_height, y_begin + tile_size);
 
-                const T *tile_input = in + y_begin * istrides[0] +
-                                      x_begin * istrides[1] + z * istrides[2] +
-                                      w * istrides[3];
-                T *tile_output = out + x_begin * ostrides[0] +
-                                 y_begin * ostrides[1] + z * ostrides[2] +
-                                 w * ostrides[3];
+                const T *tile_input = in + y_begin * input_x_stride +
+                                      x_begin * input_y_stride +
+                                      z * input_z_stride + w * input_w_stride;
+                T *tile_output = out + x_begin * output_x_stride +
+                                 y_begin * output_y_stride +
+                                 z * output_z_stride + w * output_w_stride;
+                size_t run = 1;
                 if (x_end - x_begin == tile_size &&
                     y_end - y_begin == tile_size) {
-                    transpose_tile<T, conjugate>(tile_output, tile_input,
-                                                 ostrides[1], istrides[1]);
+                    run = std::min(end - tile, full_x_tiles - tile_x);
+                    transpose_tile_run<T, conjugate>(
+                        tile_output, tile_input, output_x_stride,
+                        output_y_stride, input_x_stride, input_y_stride, run,
+                        use_avx2);
                 } else {
                     // Read contiguous input rows and scatter within a
                     // cache-sized tile. Reversing these loops makes every
                     // input access strided.
                     for (dim_t x = x_begin; x < x_end; ++x) {
-                        const T *input_ptr = in + y_begin * istrides[0] +
-                                             x * istrides[1] + z * istrides[2] +
-                                             w * istrides[3];
-                        T *output_ptr = out + x * ostrides[0] +
-                                        y_begin * ostrides[1] +
-                                        z * ostrides[2] + w * ostrides[3];
+                        const T *input_ptr =
+                            in + y_begin * input_x_stride + x * input_y_stride +
+                            z * input_z_stride + w * input_w_stride;
+                        T *output_ptr = out + x * output_x_stride +
+                                        y_begin * output_y_stride +
+                                        z * output_z_stride +
+                                        w * output_w_stride;
                         for (dim_t y = y_begin; y < y_end; ++y) {
                             if constexpr (conjugate) {
                                 *output_ptr = getConjugate(*input_ptr);
                             } else {
                                 *output_ptr = *input_ptr;
                             }
-                            input_ptr += istrides[0];
-                            output_ptr += ostrides[1];
+                            if (y + 1 < y_end) {
+                                input_ptr += input_x_stride;
+                                output_ptr += output_y_stride;
+                            }
                         }
                     }
                 }
 
-                if (++tile_x == x_tiles) {
+                tile += run;
+                tile_x += run;
+                if (tile_x == x_tiles) {
                     tile_x = 0;
                     if (++tile_y == y_tiles) {
                         tile_y = 0;
-                        if (++z == odims[2]) {
+                        if (++z == depth) {
                             z = 0;
                             ++w;
                         }
@@ -180,76 +276,82 @@ void transpose_out(Param<T> output, CParam<T> input) {
         });
 }
 
-template<typename T>
-void transpose_real_serial(Param<T> output, CParam<T> input) {
+template<typename T, bool conjugate>
+void transpose_serial(Param<T> output, CParam<T> input) {
     const af::dim4 odims    = output.dims();
     const af::dim4 ostrides = output.strides();
     const af::dim4 istrides = input.strides();
 
-    T *out            = output.get();
-    T const *const in = input.get();
+    T *const out      = output.get();
+    const T *const in = input.get();
 
-    constexpr int tile_size = 8;
-    const dim_t odims1_down = floor(odims[1] / tile_size) * tile_size;
-    const dim_t odims0_down = floor(odims[0] / tile_size) * tile_size;
+    const dim_t output_width  = odims[0];
+    const dim_t output_height = odims[1];
+    const dim_t depth         = odims[2];
+    const dim_t batches       = odims[3];
 
-    for (dim_t l = 0; l < odims[3]; ++l) {
-        for (dim_t k = 0; k < odims[2]; ++k) {
-            T *out_      = out + l * ostrides[3] + k * ostrides[2];
-            const T *in_ = in + l * istrides[3] + k * istrides[2];
+    const dim_t output_x_stride = ostrides[0];
+    const dim_t output_y_stride = ostrides[1];
+    const dim_t output_z_stride = ostrides[2];
+    const dim_t output_w_stride = ostrides[3];
+    const dim_t input_x_stride  = istrides[0];
+    const dim_t input_y_stride  = istrides[1];
+    const dim_t input_z_stride  = istrides[2];
+    const dim_t input_w_stride  = istrides[3];
 
-            if (odims1_down > 0) {
-                for (dim_t j = 0; j <= odims1_down; j += tile_size) {
-                    for (dim_t i = 0; i < odims0_down; i += tile_size) {
-                        transpose_tile<T, false>(out_, in_, ostrides[1],
-                                                 istrides[1]);
-                        out_ += tile_size;
-                        in_ += istrides[1] * tile_size;
-                    }
+    constexpr dim_t tile_size = 8;
+    const dim_t full_width    = output_width / tile_size * tile_size;
+    const dim_t full_height   = output_height / tile_size * tile_size;
+    const size_t full_x_tiles = static_cast<size_t>(full_width / tile_size);
+    const bool use_avx2 =
+        detail::canUseTransposeAVX2<T>(output_x_stride, input_x_stride);
 
-                    for (dim_t jj = 0; jj < tile_size; ++jj) {
-                        for (dim_t i = odims0_down; i < odims[0]; ++i) {
-                            *out_ = *in_;
-                            ++out_;
-                            in_ += istrides[1];
+    for (dim_t w = 0; w < batches; ++w) {
+        for (dim_t z = 0; z < depth; ++z) {
+            T *const output_batch =
+                out + z * output_z_stride + w * output_w_stride;
+            const T *const input_batch =
+                in + z * input_z_stride + w * input_w_stride;
+
+            for (dim_t y = 0; y < full_height; y += tile_size) {
+                if (full_x_tiles > 0) {
+                    transpose_tile_run<T, conjugate>(
+                        output_batch + y * output_y_stride,
+                        input_batch + y * input_x_stride, output_x_stride,
+                        output_y_stride, input_x_stride, input_y_stride,
+                        full_x_tiles, use_avx2);
+                }
+
+                for (dim_t x = full_width; x < output_width; ++x) {
+                    T *output_ptr = output_batch + x * output_x_stride +
+                                    y * output_y_stride;
+                    const T *input_ptr =
+                        input_batch + y * input_x_stride + x * input_y_stride;
+                    for (dim_t offset = 0; offset < tile_size; ++offset) {
+                        if constexpr (conjugate) {
+                            *output_ptr = getConjugate(*input_ptr);
+                        } else {
+                            *output_ptr = *input_ptr;
                         }
-                        out_ += ostrides[1] - (odims[0] - odims0_down);
-                        in_ -= (odims[0] - odims0_down) * istrides[1] - 1;
+                        if (offset + 1 < tile_size) {
+                            output_ptr += output_y_stride;
+                            input_ptr += input_x_stride;
+                        }
                     }
-                    out_ = out + l * ostrides[3] + k * ostrides[2] +
-                           j * ostrides[1];
-                    in_ = in + l * istrides[3] + k * istrides[2] + j;
                 }
             }
-            for (dim_t j = odims1_down; j < odims[1]; ++j) {
-                out_ =
-                    out + l * ostrides[3] + k * ostrides[2] + j * ostrides[1];
-                in_ = in + l * istrides[3] + k * istrides[2] + j;
-                for (dim_t i = 0; i < odims[0]; ++i) {
-                    *out_ = *in_;
-                    ++out_;
-                    in_ += istrides[1];
-                }
-            }
-        }
-    }
-}
 
-template<typename T>
-void transpose_conj_serial(Param<T> output, CParam<T> input) {
-    const af::dim4 odims    = output.dims();
-    const af::dim4 ostrides = output.strides();
-    const af::dim4 istrides = input.strides();
-
-    T *out            = output.get();
-    T const *const in = input.get();
-    for (dim_t l = 0; l < odims[3]; ++l) {
-        for (dim_t k = 0; k < odims[2]; ++k) {
-            for (dim_t j = 0; j < odims[1]; ++j) {
-                for (dim_t i = 0; i < odims[0]; ++i) {
-                    const dim_t in_idx  = getIdx(istrides, j, i, k, l);
-                    const dim_t out_idx = getIdx(ostrides, i, j, k, l);
-                    out[out_idx]        = getConjugate(in[in_idx]);
+            for (dim_t y = full_height; y < output_height; ++y) {
+                for (dim_t x = 0; x < output_width; ++x) {
+                    T *output_ptr = output_batch + x * output_x_stride +
+                                    y * output_y_stride;
+                    const T *input_ptr =
+                        input_batch + y * input_x_stride + x * input_y_stride;
+                    if constexpr (conjugate) {
+                        *output_ptr = getConjugate(*input_ptr);
+                    } else {
+                        *output_ptr = *input_ptr;
+                    }
                 }
             }
         }
@@ -261,7 +363,7 @@ void transpose_real(Param<T> output, CParam<T> input) {
     constexpr dim_t min_parallel_elements = 1 << 17;
     if (getParallelThreadCount() == 1 ||
         output.dims().elements() < min_parallel_elements) {
-        transpose_real_serial(output, input);
+        transpose_serial<T, false>(output, input);
     } else {
         transpose_out<T, false>(output, input);
     }
@@ -272,7 +374,7 @@ void transpose_conj(Param<T> output, CParam<T> input) {
     constexpr dim_t min_parallel_elements = 1 << 17;
     if (getParallelThreadCount() == 1 ||
         output.dims().elements() < min_parallel_elements) {
-        transpose_conj_serial(output, input);
+        transpose_serial<T, true>(output, input);
     } else {
         transpose_out<T, true>(output, input);
     }

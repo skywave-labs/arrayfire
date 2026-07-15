@@ -14,6 +14,9 @@
 #include <af/dim4.hpp>
 #include <af/traits.hpp>
 
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -23,6 +26,8 @@ using af::cdouble;
 using af::cfloat;
 using af::dim4;
 using af::dtype_traits;
+using af::seq;
+using af::span;
 using std::abs;
 using std::endl;
 using std::string;
@@ -149,6 +154,274 @@ TYPED_TEST(Transpose, SubRef) {
 TYPED_TEST(Transpose, SubRefBatch) {
     trsTest<TypeParam>(string(TEST_DIR "/transpose/offset_batch.test"), true,
                        &(this->subMat3D));
+}
+
+template<typename T>
+T transposeInputValue(size_t index) {
+    return static_cast<T>(static_cast<int>((17 * index) % 251) - 125);
+}
+
+template<>
+cfloat transposeInputValue<cfloat>(size_t index) {
+    return cfloat(
+        static_cast<float>(static_cast<int>((17 * index) % 251) - 125),
+        static_cast<float>(static_cast<int>((29 * index) % 127) - 63));
+}
+
+template<>
+cdouble transposeInputValue<cdouble>(size_t index) {
+    return cdouble(
+        static_cast<double>(static_cast<int>((17 * index) % 251) - 125),
+        static_cast<double>(static_cast<int>((29 * index) % 127) - 63));
+}
+
+template<typename T>
+T conjugateTransposeValue(const T &value) {
+    return value;
+}
+
+template<>
+cfloat conjugateTransposeValue(const cfloat &value) {
+    return cfloat(value.real, -value.imag);
+}
+
+template<>
+cdouble conjugateTransposeValue(const cdouble &value) {
+    return cdouble(value.real, -value.imag);
+}
+
+template<typename T>
+void checkTransposeReference(const array &input, const vector<T> &input_values,
+                             bool conjugate = false) {
+    const dim4 dims = input.dims();
+    ASSERT_EQ(static_cast<size_t>(dims.elements()), input_values.size());
+
+    const array output = transpose(input, conjugate);
+    vector<T> actual(input_values.size());
+    output.host(actual.data());
+
+    for (dim_t w = 0; w < dims[3]; ++w) {
+        for (dim_t z = 0; z < dims[2]; ++z) {
+            for (dim_t y = 0; y < dims[1]; ++y) {
+                for (dim_t x = 0; x < dims[0]; ++x) {
+                    const size_t input_index = static_cast<size_t>(
+                        x + dims[0] * (y + dims[1] * (z + dims[2] * w)));
+                    const size_t output_index = static_cast<size_t>(
+                        y + dims[1] * (x + dims[0] * (z + dims[2] * w)));
+                    const T expected =
+                        conjugate
+                            ? conjugateTransposeValue(input_values[input_index])
+                            : input_values[input_index];
+                    ASSERT_EQ(expected, actual[output_index])
+                        << "at: " << output_index;
+                }
+            }
+        }
+    }
+}
+
+template<typename T>
+class TransposeTiled : public ::testing::Test {};
+
+using TiledTypes = ::testing::Types<float, double, int, unsigned, long long,
+                                    unsigned long long, cfloat, cdouble>;
+TYPED_TEST_SUITE(TransposeTiled, TiledTypes);
+
+TYPED_TEST(TransposeTiled, BoundariesAndBatches) {
+    SUPPORTED_TYPE_CHECK(TypeParam);
+
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+    if (active_backend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU tiled-transpose regression";
+    }
+
+    const std::array<dim4, 12> shapes = {
+        dim4(7, 8),   dim4(8, 7),   dim4(8, 8),      dim4(9, 8),
+        dim4(8, 9),   dim4(15, 16), dim4(16, 15),    dim4(16, 16),
+        dim4(17, 16), dim4(16, 17), dim4(24, 32, 2), dim4(32, 24, 2, 2)};
+
+    for (const dim4 &dims : shapes) {
+        vector<TypeParam> input_values(static_cast<size_t>(dims.elements()));
+        for (size_t i = 0; i < input_values.size(); ++i) {
+            input_values[i] = transposeInputValue<TypeParam>(i);
+        }
+        checkTransposeReference(array(dims, input_values.data()), input_values);
+    }
+}
+
+TYPED_TEST(TransposeTiled, OffsetAndPaddedRows) {
+    SUPPORTED_TYPE_CHECK(TypeParam);
+
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+    if (active_backend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU tiled-transpose regression";
+    }
+
+    const dim4 parent_dims(35, 29, 2, 2);
+    vector<TypeParam> parent_values(
+        static_cast<size_t>(parent_dims.elements()));
+    for (size_t i = 0; i < parent_values.size(); ++i) {
+        parent_values[i] = transposeInputValue<TypeParam>(i);
+    }
+
+    const array parent(parent_dims, parent_values.data());
+    const array input = parent(seq(1, 32), seq(2, 25), span, span);
+    vector<TypeParam> input_values(static_cast<size_t>(input.elements()));
+    input.host(input_values.data());
+    checkTransposeReference(input, input_values);
+
+    const array reversed = parent(seq(1, 32), seq(25, 2, -1), span, span);
+    vector<TypeParam> reversed_values(static_cast<size_t>(reversed.elements()));
+    reversed.host(reversed_values.data());
+    checkTransposeReference(reversed, reversed_values);
+}
+
+TYPED_TEST(TransposeTiled, ParallelBatchedShapes) {
+    SUPPORTED_TYPE_CHECK(TypeParam);
+
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+    if (active_backend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU tiled-transpose regression";
+    }
+
+    for (const dim4 dims : {dim4(513, 257, 2, 2), dim4(512, 256, 2, 2)}) {
+        vector<TypeParam> input_values(static_cast<size_t>(dims.elements()));
+        for (size_t i = 0; i < input_values.size(); ++i) {
+            input_values[i] = transposeInputValue<TypeParam>(i);
+        }
+        checkTransposeReference(array(dims, input_values.data()), input_values);
+    }
+}
+
+template<typename T>
+class TransposeTiledComplex : public ::testing::Test {};
+
+using TiledComplexTypes = ::testing::Types<cfloat, cdouble>;
+TYPED_TEST_SUITE(TransposeTiledComplex, TiledComplexTypes);
+
+TYPED_TEST(TransposeTiledComplex, ConjugateSerialAndParallel) {
+    SUPPORTED_TYPE_CHECK(TypeParam);
+
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+    if (active_backend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU tiled-transpose regression";
+    }
+
+    for (const dim4 dims : {dim4(32, 24, 2), dim4(513, 257, 2)}) {
+        vector<TypeParam> input_values(static_cast<size_t>(dims.elements()));
+        for (size_t i = 0; i < input_values.size(); ++i) {
+            input_values[i] = transposeInputValue<TypeParam>(i);
+        }
+        checkTransposeReference(array(dims, input_values.data()), input_values,
+                                true);
+    }
+}
+
+template<typename Value, typename Bits>
+Value transposeValueFromBits(Bits bits) {
+    static_assert(sizeof(Value) == sizeof(Bits), "bit width mismatch");
+    Value value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+template<typename Bits, typename Value>
+Bits transposeValueBits(Value value) {
+    static_assert(sizeof(Value) == sizeof(Bits), "bit width mismatch");
+    Bits bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+template<typename Value, typename Bits, size_t PatternCount>
+void checkRealTransposeBitPatterns(
+    const std::array<Bits, PatternCount> &patterns) {
+    constexpr dim_t side = 16;
+    const dim4 dims(side, side);
+    vector<Value> input_values(static_cast<size_t>(dims.elements()));
+    vector<Value> expected(input_values.size());
+    for (size_t i = 0; i < input_values.size(); ++i) {
+        input_values[i] =
+            transposeValueFromBits<Value>(patterns[i % PatternCount]);
+    }
+    for (dim_t y = 0; y < side; ++y) {
+        for (dim_t x = 0; x < side; ++x) {
+            expected[static_cast<size_t>(y + side * x)] =
+                input_values[static_cast<size_t>(x + side * y)];
+        }
+    }
+
+    const array output = transpose(array(dims, input_values.data()));
+    vector<Value> actual(input_values.size());
+    output.host(actual.data());
+    ASSERT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                             expected.size() * sizeof(Value)));
+}
+
+TEST(TransposeTiled, PreservesFloatingPointBits) {
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+    if (active_backend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU bitwise-transpose regression";
+    }
+
+    constexpr std::array<std::uint32_t, 8> float_patterns = {
+        0x00000000U, 0x80000000U, 0x7F800000U, 0xFF800000U,
+        0x7FC12345U, 0xFFC54321U, 0x3F800000U, 0xBF000000U};
+    constexpr std::array<std::uint64_t, 8> double_patterns = {
+        0x0000000000000000ULL, 0x8000000000000000ULL, 0x7FF0000000000000ULL,
+        0xFFF0000000000000ULL, 0x7FF8123456789ABCULL, 0xFFF8543210FEDCBAULL,
+        0x3FF0000000000000ULL, 0xBFE0000000000000ULL};
+    checkRealTransposeBitPatterns<float>(float_patterns);
+    checkRealTransposeBitPatterns<double>(double_patterns);
+}
+
+template<typename Complex, typename Value, typename Bits>
+void checkComplexConjugateBits(Bits sign_bit) {
+    static_assert(sizeof(Complex) == 2 * sizeof(Value));
+    constexpr dim_t side = 16;
+    const dim4 dims(side, side);
+    vector<Complex> input_values(static_cast<size_t>(dims.elements()));
+    vector<Complex> expected(input_values.size());
+    for (size_t i = 0; i < input_values.size(); ++i) {
+        const Bits real_bits =
+            static_cast<Bits>(i * 0x101U) ^ (i % 2 == 0 ? sign_bit : 0);
+        const Bits imag_bits =
+            static_cast<Bits>(i * 0x10001U) ^ (i % 3 == 0 ? sign_bit : 0);
+        input_values[i] = Complex(transposeValueFromBits<Value>(real_bits),
+                                  transposeValueFromBits<Value>(imag_bits));
+    }
+    for (dim_t y = 0; y < side; ++y) {
+        for (dim_t x = 0; x < side; ++x) {
+            const Complex value =
+                input_values[static_cast<size_t>(x + side * y)];
+            expected[static_cast<size_t>(y + side * x)] =
+                Complex(value.real,
+                        transposeValueFromBits<Value>(
+                            transposeValueBits<Bits>(value.imag) ^ sign_bit));
+        }
+    }
+
+    const array output = transpose(array(dims, input_values.data()), true);
+    vector<Complex> actual(input_values.size());
+    output.host(actual.data());
+    ASSERT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                             expected.size() * sizeof(Complex)));
+}
+
+TEST(TransposeTiled, ConjugateFlipsOnlyImaginarySign) {
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+    if (active_backend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU bitwise-transpose regression";
+    }
+
+    checkComplexConjugateBits<cfloat, float>(0x80000000U);
+    checkComplexConjugateBits<cdouble, double>(0x8000000000000000ULL);
 }
 
 ////////////////////////////////////// CPP //////////////////////////////////
