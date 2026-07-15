@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 using af::array;
@@ -219,6 +220,7 @@ TEST(ReduceAllParallel, NaNOnlyPartitionsDoNotMaskValidExtrema) {
 namespace {
 
 constexpr dim_t dimensionalReduceLength = 257;
+constexpr dim_t dimensionalTileBytes    = 128;
 
 dim4 dimensionalReduceDims(const dim_t width, const int dim) {
     dim4 dims(width, 3, 3, 3);
@@ -784,6 +786,293 @@ void checkComplexScalarNanvalParity() {
     EXPECT_EQ(0, std::memcmp(&scalarProduct, &arrayProduct, sizeof(T)));
 }
 
+template<typename T>
+T integralSumPattern(const size_t line, const dim_t reducedIndex) {
+    if (reducedIndex == 0) {
+        if (std::is_signed<T>::value) {
+            return static_cast<T>(std::numeric_limits<T>::max() / 2);
+        } else {
+            return static_cast<T>(std::numeric_limits<T>::max() -
+                                  static_cast<T>(line % 7));
+        }
+    }
+    if (reducedIndex == 1) {
+        if (std::is_signed<T>::value) {
+            return static_cast<T>(std::numeric_limits<T>::lowest() / 2);
+        } else {
+            return T(17);
+        }
+    }
+    if (std::is_signed<T>::value) {
+        return static_cast<T>(static_cast<int>((line + reducedIndex) % 7) - 3);
+    } else {
+        return static_cast<T>((line + reducedIndex) % 7);
+    }
+}
+
+template<typename T>
+T integralProductPattern(const size_t line, const dim_t reducedIndex) {
+    if (reducedIndex == 0) {
+        if (std::is_signed<T>::value) {
+            return static_cast<T>(std::numeric_limits<T>::max() / 4 -
+                                  static_cast<T>(line % 7));
+        } else {
+            return static_cast<T>(std::numeric_limits<T>::max() -
+                                  static_cast<T>(line % 7));
+        }
+    }
+    if (reducedIndex == 1) { return T(std::is_signed<T>::value ? 2 : 3); }
+    if (std::is_signed<T>::value) {
+        return reducedIndex == 2 ? T(-1) : T(1);
+    } else {
+        return T(1);
+    }
+}
+
+template<typename T>
+T integralExtremaPattern(const size_t line, const dim_t reducedIndex) {
+    const dim_t minimumIndex =
+        static_cast<dim_t>((17 * line + 3) % dimensionalReduceLength);
+    dim_t maximumIndex =
+        static_cast<dim_t>((31 * line + 11) % dimensionalReduceLength);
+    if (maximumIndex == minimumIndex) {
+        maximumIndex = (maximumIndex + 1) % dimensionalReduceLength;
+    }
+    if (reducedIndex == minimumIndex) {
+        return std::numeric_limits<T>::lowest();
+    }
+    if (reducedIndex == maximumIndex) { return std::numeric_limits<T>::max(); }
+    if (std::is_signed<T>::value) {
+        return static_cast<T>(static_cast<int>((line + 5 * reducedIndex) % 47) -
+                              23);
+    } else {
+        return static_cast<T>(std::numeric_limits<T>::max() / 2 +
+                              static_cast<T>((line + reducedIndex) % 47));
+    }
+}
+
+template<typename Ti, typename To>
+void checkDimensionalIntegralArithmetic(const dim_t width, const int dim) {
+    const dim4 dims = dimensionalReduceDims(width, dim);
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<Ti> sumInput(static_cast<size_t>(dims.elements()));
+    vector<Ti> productInput(static_cast<size_t>(dims.elements()));
+    vector<To> expectedSum(static_cast<size_t>(outputDims.elements()));
+    vector<To> expectedProduct(static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        linearIndex(outputDims, x, y, z, w);
+                    To sumValue     = To(0);
+                    To productValue = To(1);
+                    for (dim_t r = 0; r < dims[dim]; ++r) {
+                        coords[dim] = r;
+                        const Ti sumInputValue =
+                            integralSumPattern<Ti>(outputIndex, r);
+                        const Ti productInputValue =
+                            integralProductPattern<Ti>(outputIndex, r);
+                        const size_t inputIndex = linearIndex(
+                            dims, coords[0], coords[1], coords[2], coords[3]);
+                        sumInput[inputIndex]     = sumInputValue;
+                        productInput[inputIndex] = productInputValue;
+                        sumValue = static_cast<To>(sumInputValue) + sumValue;
+                        productValue =
+                            static_cast<To>(productInputValue) * productValue;
+                    }
+                    expectedSum[outputIndex]     = sumValue;
+                    expectedProduct[outputIndex] = productValue;
+                }
+            }
+        }
+    }
+
+    const array sumOutput = af::sum(array(dims, sumInput.data()), dim);
+    const array productOutput =
+        af::product(array(dims, productInput.data()), dim);
+    vector<To> actualSum(expectedSum.size());
+    vector<To> actualProduct(expectedProduct.size());
+    sumOutput.host(actualSum.data());
+    productOutput.host(actualProduct.data());
+    expectBitwiseEqual(expectedSum, actualSum);
+    expectBitwiseEqual(expectedProduct, actualProduct);
+}
+
+template<typename T>
+void checkDimensionalIntegralExtrema(const dim_t width, const int dim) {
+    const dim4 dims = dimensionalReduceDims(width, dim);
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<T> input(static_cast<size_t>(dims.elements()));
+    vector<T> expectedMin(static_cast<size_t>(outputDims.elements()));
+    vector<T> expectedMax(static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        linearIndex(outputDims, x, y, z, w);
+                    T minValue = std::numeric_limits<T>::max();
+                    T maxValue = std::numeric_limits<T>::lowest();
+                    for (dim_t r = 0; r < dims[dim]; ++r) {
+                        coords[dim] = r;
+                        const T inputValue =
+                            integralExtremaPattern<T>(outputIndex, r);
+                        input[linearIndex(dims, coords[0], coords[1], coords[2],
+                                          coords[3])] = inputValue;
+                        minValue = std::min(inputValue, minValue);
+                        maxValue = std::max(inputValue, maxValue);
+                    }
+                    expectedMin[outputIndex] = minValue;
+                    expectedMax[outputIndex] = maxValue;
+                }
+            }
+        }
+    }
+
+    const array inputArray(dims, input.data());
+    const array minOutput = af::min(inputArray, dim);
+    const array maxOutput = af::max(inputArray, dim);
+    vector<T> actualMin(expectedMin.size());
+    vector<T> actualMax(expectedMax.size());
+    minOutput.host(actualMin.data());
+    maxOutput.host(actualMax.data());
+    expectBitwiseEqual(expectedMin, actualMin);
+    expectBitwiseEqual(expectedMax, actualMax);
+}
+
+template<typename T>
+void checkGappedIntegralExtrema(const int dim) {
+    const dim_t width =
+        static_cast<dim_t>(dimensionalTileBytes / sizeof(T) + 3);
+    const dim4 dims = dimensionalReduceDims(width, dim);
+    dim4 parentDims = dims;
+    parentDims[dim] += 2;
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<T> input(static_cast<size_t>(parentDims.elements()),
+                    std::numeric_limits<T>::max());
+    vector<T> expectedMin(static_cast<size_t>(outputDims.elements()));
+    vector<T> expectedMax(static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        linearIndex(outputDims, x, y, z, w);
+                    T minValue = std::numeric_limits<T>::max();
+                    T maxValue = std::numeric_limits<T>::lowest();
+                    for (dim_t r = 0; r < dims[dim]; ++r) {
+                        coords[dim] = r + 1;
+                        const T inputValue =
+                            integralExtremaPattern<T>(outputIndex, r);
+                        input[linearIndex(parentDims, coords[0], coords[1],
+                                          coords[2], coords[3])] = inputValue;
+                        minValue = std::min(inputValue, minValue);
+                        maxValue = std::max(inputValue, maxValue);
+                    }
+                    expectedMin[outputIndex] = minValue;
+                    expectedMax[outputIndex] = maxValue;
+                }
+            }
+        }
+    }
+
+    const array parent(parentDims, input.data());
+    array view;
+    if (dim == 1) {
+        view = parent(span, seq(1, dimensionalReduceLength), span, span);
+    } else if (dim == 2) {
+        view = parent(span, span, seq(1, dimensionalReduceLength), span);
+    } else {
+        view = parent(span, span, span, seq(1, dimensionalReduceLength));
+    }
+    vector<T> actualMin(expectedMin.size());
+    vector<T> actualMax(expectedMax.size());
+    af::min(view, dim).host(actualMin.data());
+    af::max(view, dim).host(actualMax.data());
+    expectBitwiseEqual(expectedMin, actualMin);
+    expectBitwiseEqual(expectedMax, actualMax);
+}
+
+template<typename Ti, typename To>
+void checkGappedIntegralArithmetic(const int dim) {
+    const dim_t width =
+        static_cast<dim_t>(dimensionalTileBytes / sizeof(To) + 3);
+    const dim4 dims = dimensionalReduceDims(width, dim);
+    dim4 parentDims = dims;
+    parentDims[dim] += 2;
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<Ti> sumInput(static_cast<size_t>(parentDims.elements()), Ti(0));
+    vector<Ti> productInput(static_cast<size_t>(parentDims.elements()), Ti(1));
+    vector<To> expectedSum(static_cast<size_t>(outputDims.elements()));
+    vector<To> expectedProduct(static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        linearIndex(outputDims, x, y, z, w);
+                    To sumValue     = To(0);
+                    To productValue = To(1);
+                    for (dim_t r = 0; r < dims[dim]; ++r) {
+                        coords[dim] = r + 1;
+                        const Ti sumInputValue =
+                            integralSumPattern<Ti>(outputIndex, r);
+                        const Ti productInputValue =
+                            integralProductPattern<Ti>(outputIndex, r);
+                        const size_t inputIndex =
+                            linearIndex(parentDims, coords[0], coords[1],
+                                        coords[2], coords[3]);
+                        sumInput[inputIndex]     = sumInputValue;
+                        productInput[inputIndex] = productInputValue;
+                        sumValue = static_cast<To>(sumInputValue) + sumValue;
+                        productValue =
+                            static_cast<To>(productInputValue) * productValue;
+                    }
+                    expectedSum[outputIndex]     = sumValue;
+                    expectedProduct[outputIndex] = productValue;
+                }
+            }
+        }
+    }
+
+    const array sumParent(parentDims, sumInput.data());
+    const array productParent(parentDims, productInput.data());
+    array sumView;
+    array productView;
+    if (dim == 1) {
+        sumView = sumParent(span, seq(1, dimensionalReduceLength), span, span);
+        productView =
+            productParent(span, seq(1, dimensionalReduceLength), span, span);
+    } else if (dim == 2) {
+        sumView = sumParent(span, span, seq(1, dimensionalReduceLength), span);
+        productView =
+            productParent(span, span, seq(1, dimensionalReduceLength), span);
+    } else {
+        sumView = sumParent(span, span, span, seq(1, dimensionalReduceLength));
+        productView =
+            productParent(span, span, span, seq(1, dimensionalReduceLength));
+    }
+    vector<To> actualSum(expectedSum.size());
+    vector<To> actualProduct(expectedProduct.size());
+    af::sum(sumView, dim).host(actualSum.data());
+    af::product(productView, dim).host(actualProduct.data());
+    expectBitwiseEqual(expectedSum, actualSum);
+    expectBitwiseEqual(expectedProduct, actualProduct);
+}
+
 }  // namespace
 
 TEST(ReduceDimExactCpu, SumF32PreservesScalarFold) {
@@ -861,4 +1150,122 @@ TEST(ReduceDimExactCpu, ComplexScalarNanvalMatchesArrayReturn) {
     SKIP_IF_FAST_MATH_ENABLED();
     checkComplexScalarNanvalParity<cfloat>();
     checkComplexScalarNanvalParity<cdouble>();
+}
+
+TEST(ReduceDimExactCpu, IntegralArithmeticPreservesScalarFold) {
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        checkDimensionalIntegralArithmetic<signed char, int>(35, dim);
+        checkDimensionalIntegralArithmetic<unsigned char, unsigned int>(35,
+                                                                        dim);
+        checkDimensionalIntegralArithmetic<short, int>(35, dim);
+        checkDimensionalIntegralArithmetic<unsigned short, unsigned int>(35,
+                                                                         dim);
+        checkDimensionalIntegralArithmetic<int, int>(35, dim);
+        checkDimensionalIntegralArithmetic<unsigned int, unsigned int>(35, dim);
+        checkDimensionalIntegralArithmetic<long long, long long>(19, dim);
+        checkDimensionalIntegralArithmetic<unsigned long long,
+                                           unsigned long long>(19, dim);
+    }
+}
+
+TEST(ReduceDimExactCpu, IntegralExtremaPreserveScalarFold) {
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        checkDimensionalIntegralExtrema<signed char>(131, dim);
+        checkDimensionalIntegralExtrema<unsigned char>(131, dim);
+        checkDimensionalIntegralExtrema<short>(67, dim);
+        checkDimensionalIntegralExtrema<unsigned short>(67, dim);
+        checkDimensionalIntegralExtrema<int>(35, dim);
+        checkDimensionalIntegralExtrema<unsigned int>(35, dim);
+        checkDimensionalIntegralExtrema<long long>(19, dim);
+        checkDimensionalIntegralExtrema<unsigned long long>(19, dim);
+    }
+}
+
+TEST(ReduceDimExactCpu, IntegralVectorTileWidthsPreserveScalarFold) {
+    const dim_t promotedWidths[] = {8, 9, 16, 25};
+    for (const dim_t width : promotedWidths) {
+        SCOPED_TRACE(::testing::Message() << "promoted width " << width);
+        checkDimensionalIntegralArithmetic<signed char, int>(width, 1);
+    }
+    const dim_t byteWidths[] = {32, 33, 64, 97};
+    for (const dim_t width : byteWidths) {
+        SCOPED_TRACE(::testing::Message() << "byte width " << width);
+        checkDimensionalIntegralExtrema<unsigned char>(width, 1);
+    }
+    const dim_t wordWidths[] = {8, 9, 16, 25};
+    for (const dim_t width : wordWidths) {
+        SCOPED_TRACE(::testing::Message() << "word width " << width);
+        checkDimensionalIntegralArithmetic<unsigned int, unsigned int>(width,
+                                                                       1);
+    }
+    const dim_t longWidths[] = {4, 5, 8, 13};
+    for (const dim_t width : longWidths) {
+        SCOPED_TRACE(::testing::Message() << "long width " << width);
+        checkDimensionalIntegralArithmetic<unsigned long long,
+                                           unsigned long long>(width, 1);
+        checkDimensionalIntegralExtrema<unsigned long long>(width, 1);
+    }
+}
+
+TEST(ReduceDimExactCpu, GappedIntegralExtremaPreserveScalarFold) {
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        checkGappedIntegralExtrema<int>(dim);
+        checkGappedIntegralExtrema<unsigned long long>(dim);
+    }
+}
+
+TEST(ReduceDimExactCpu, GappedIntegralArithmeticPreservesScalarFold) {
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        checkGappedIntegralArithmetic<signed char, int>(dim);
+        checkGappedIntegralArithmetic<unsigned char, unsigned int>(dim);
+    }
+}
+
+TEST(ReduceDimExactCpu, LazyIntegralInputIsEvaluatedBeforeReduction) {
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        const dim4 dims       = dimensionalReduceDims(35, dim);
+        dim4 outputDims       = dims;
+        outputDims[dim]       = 1;
+        const array input     = af::range(dims, dim, s32) * 3 - 7;
+        const int expectedMin = -7;
+        const int expectedMax =
+            3 * static_cast<int>(dims[dim] - 1) + expectedMin;
+        const int expectedSum =
+            3 * static_cast<int>(dims[dim] * (dims[dim] - 1) / 2) +
+            expectedMin * static_cast<int>(dims[dim]);
+        vector<int> minOutput(static_cast<size_t>(outputDims.elements()));
+        vector<int> maxOutput(minOutput.size());
+        vector<int> sumOutput(minOutput.size());
+        af::min(input, dim).host(minOutput.data());
+        af::max(input, dim).host(maxOutput.data());
+        af::sum(input, dim).host(sumOutput.data());
+        for (size_t i = 0; i < minOutput.size(); ++i) {
+            EXPECT_EQ(expectedMin, minOutput[i]);
+            EXPECT_EQ(expectedMax, maxOutput[i]);
+            EXPECT_EQ(expectedSum, sumOutput[i]);
+        }
+    }
+}
+
+TEST(ReduceDimExactCpu, BooleanExtremaRetainLogicalSemantics) {
+    const dim4 dims(64, 65);
+    vector<char> input(static_cast<size_t>(dims.elements()), char(3));
+    for (dim_t x = 0; x < dims[0]; ++x) {
+        input[linearIndex(dims, x, 0, 0, 0)] = char(2);
+        if (x & 1) { input[linearIndex(dims, x, 1, 0, 0)] = char(0); }
+    }
+    vector<char> minOutput(static_cast<size_t>(dims[0]));
+    vector<char> maxOutput(minOutput.size());
+    const array inputArray(dims, input.data());
+    af::min(inputArray, 1).host(minOutput.data());
+    af::max(inputArray, 1).host(maxOutput.data());
+    for (size_t i = 0; i < minOutput.size(); ++i) {
+        EXPECT_EQ(char(i & 1 ? 0 : 1), minOutput[i]);
+        EXPECT_EQ(char(1), maxOutput[i]);
+    }
 }

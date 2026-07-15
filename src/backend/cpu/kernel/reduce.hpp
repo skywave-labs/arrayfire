@@ -36,39 +36,66 @@ namespace kernel {
 
 namespace detail {
 
-template<typename T>
-constexpr bool isAVX2SumType =
-    std::is_same<T, float>::value || std::is_same<T, double>::value ||
-    std::is_same<T, cfloat>::value || std::is_same<T, cdouble>::value;
+constexpr size_t minAVX2DimensionalInputElements = 1U << 12U;
+
+template<typename Ti, typename To>
+constexpr bool isAVX2IntegralArithmeticPair =
+    (std::is_same<Ti, int>::value && std::is_same<To, int>::value) ||
+    (std::is_same<Ti, uint>::value && std::is_same<To, uint>::value) ||
+    (std::is_same<Ti, intl>::value && std::is_same<To, intl>::value) ||
+    (std::is_same<Ti, uintl>::value && std::is_same<To, uintl>::value) ||
+    (std::is_same<Ti, schar>::value && std::is_same<To, int>::value) ||
+    (std::is_same<Ti, uchar>::value && std::is_same<To, uint>::value) ||
+    (std::is_same<Ti, short>::value && std::is_same<To, int>::value) ||
+    (std::is_same<Ti, ushort>::value && std::is_same<To, uint>::value);
 
 template<typename T>
-constexpr bool isAVX2ProductType =
-    std::is_same<T, float>::value || std::is_same<T, double>::value;
+constexpr bool isAVX2IntegralExtremaType =
+    std::is_same<T, schar>::value || std::is_same<T, uchar>::value ||
+    std::is_same<T, short>::value || std::is_same<T, ushort>::value ||
+    std::is_same<T, int>::value || std::is_same<T, uint>::value ||
+    std::is_same<T, intl>::value || std::is_same<T, uintl>::value;
 
-template<typename T>
-constexpr bool isAVX2ExtremaType =
-    std::is_same<T, float>::value || std::is_same<T, double>::value;
+template<typename Ti, typename To>
+constexpr bool isAVX2SumPair =
+    (std::is_same<Ti, To>::value &&
+     (std::is_same<Ti, float>::value || std::is_same<Ti, double>::value ||
+      std::is_same<Ti, cfloat>::value || std::is_same<Ti, cdouble>::value)) ||
+    isAVX2IntegralArithmeticPair<Ti, To>;
+
+template<typename Ti, typename To>
+constexpr bool isAVX2ProductPair =
+    (std::is_same<Ti, To>::value &&
+     (std::is_same<Ti, float>::value || std::is_same<Ti, double>::value)) ||
+    isAVX2IntegralArithmeticPair<Ti, To>;
+
+template<typename Ti, typename To>
+constexpr bool isAVX2ExtremaPair =
+    std::is_same<Ti, To>::value &&
+    (std::is_same<Ti, float>::value || std::is_same<Ti, double>::value ||
+     isAVX2IntegralExtremaType<Ti>);
 
 template<af_op_t op, typename Ti, typename To>
 constexpr bool isAVX2ReduceSupported =
-    (op == af_add_t && std::is_same<Ti, To>::value && isAVX2SumType<Ti>) ||
-    (op == af_mul_t && std::is_same<Ti, To>::value && isAVX2ProductType<Ti>) ||
-    ((op == af_min_t || op == af_max_t) &&
-     std::is_same<Ti, To>::value && isAVX2ExtremaType<Ti>);
+    (op == af_add_t && isAVX2SumPair<Ti, To>) ||
+    (op == af_mul_t && isAVX2ProductPair<Ti, To>) ||
+    ((op == af_min_t || op == af_max_t) && isAVX2ExtremaPair<Ti, To>);
 
 template<af_op_t op, typename Ti, typename To>
 AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
     Param<To> out, CParam<Ti> in, const int dim, bool change_nan, double nanval,
     const af::dim4 &odims, const af::dim4 &ostrides, const af::dim4 &idims,
     const af::dim4 &istrides) {
-    constexpr bool supported_sum =
-        op == af_add_t && std::is_same<Ti, To>::value && isAVX2SumType<Ti>;
+    constexpr bool supported_sum = op == af_add_t && isAVX2SumPair<Ti, To>;
     constexpr bool supported_product =
-        op == af_mul_t && std::is_same<Ti, To>::value && isAVX2ProductType<Ti>;
+        op == af_mul_t && isAVX2ProductPair<Ti, To>;
     constexpr bool supported_minimum =
-        op == af_min_t && std::is_same<Ti, To>::value && isAVX2ExtremaType<Ti>;
+        op == af_min_t && isAVX2ExtremaPair<Ti, To>;
     constexpr bool supported_maximum =
-        op == af_max_t && std::is_same<Ti, To>::value && isAVX2ExtremaType<Ti>;
+        op == af_max_t && isAVX2ExtremaPair<Ti, To>;
+    constexpr bool supported_integral =
+        isAVX2IntegralArithmeticPair<Ti, To> ||
+        (std::is_same<Ti, To>::value && isAVX2IntegralExtremaType<Ti>);
 
     if constexpr (!supported_sum && !supported_product && !supported_minimum &&
                   !supported_maximum) {
@@ -76,9 +103,8 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
     } else {
         constexpr size_t vector_bytes             = 32;
         constexpr size_t tile_bytes               = 128;
-        constexpr size_t vector_elements          = vector_bytes / sizeof(Ti);
-        constexpr size_t tile_elements            = tile_bytes / sizeof(Ti);
-        constexpr size_t min_input_elements       = 1U << 12U;
+        constexpr size_t vector_elements          = vector_bytes / sizeof(To);
+        constexpr size_t tile_elements            = tile_bytes / sizeof(To);
         constexpr size_t target_elements_per_task = 1U << 16U;
 
         if (dim < 1 || dim > 3 ||
@@ -87,7 +113,8 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
             return false;
         }
 
-        if (static_cast<size_t>(idims.elements()) < min_input_elements) {
+        if (static_cast<size_t>(idims.elements()) <
+            minAVX2DimensionalInputElements) {
             return false;
         }
 
@@ -125,23 +152,35 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
                 ? 1
                 : 1 + (target_elements_per_task - 1) / work_per_tile;
 
-        parallelForRange(tile_count, min_tiles_per_task,
-                         [=](const size_t begin, const size_t end) {
-                             if constexpr (supported_sum) {
-                                 reduceDimSumRangeAVX2(out, in, dim, change_nan,
-                                                       nanval, begin, end);
-                             } else if constexpr (supported_product) {
-                                 reduceDimProductRangeAVX2(out, in, dim,
-                                                           change_nan, nanval,
-                                                           begin, end);
-                             } else if constexpr (supported_minimum) {
-                                 reduceDimMinRangeAVX2(out, in, dim, change_nan,
-                                                      nanval, begin, end);
-                             } else {
-                                 reduceDimMaxRangeAVX2(out, in, dim, change_nan,
-                                                      nanval, begin, end);
-                             }
-                         });
+        parallelForRange(
+            tile_count, min_tiles_per_task,
+            [=](const size_t begin, const size_t end) {
+                if constexpr (supported_sum && supported_integral) {
+                    reduceDimIntegerSumRangeAVX2(out, in, dim, change_nan,
+                                                 nanval, begin, end);
+                } else if constexpr (supported_product && supported_integral) {
+                    reduceDimIntegerProductRangeAVX2(out, in, dim, change_nan,
+                                                     nanval, begin, end);
+                } else if constexpr (supported_minimum && supported_integral) {
+                    reduceDimIntegerMinRangeAVX2(out, in, dim, change_nan,
+                                                 nanval, begin, end);
+                } else if constexpr (supported_maximum && supported_integral) {
+                    reduceDimIntegerMaxRangeAVX2(out, in, dim, change_nan,
+                                                 nanval, begin, end);
+                } else if constexpr (supported_sum) {
+                    reduceDimSumRangeAVX2(out, in, dim, change_nan, nanval,
+                                          begin, end);
+                } else if constexpr (supported_product) {
+                    reduceDimProductRangeAVX2(out, in, dim, change_nan, nanval,
+                                              begin, end);
+                } else if constexpr (supported_minimum) {
+                    reduceDimMinRangeAVX2(out, in, dim, change_nan, nanval,
+                                          begin, end);
+                } else {
+                    reduceDimMaxRangeAVX2(out, in, dim, change_nan, nanval,
+                                          begin, end);
+                }
+            });
         return true;
     }
 }
@@ -201,7 +240,9 @@ void reduce_dim_parallel(Param<To> out, CParam<Ti> in, const int dim,
     const af::dim4 idims    = in.dims();
     const af::dim4 istrides = in.strides();
     if constexpr (detail::isAVX2ReduceSupported<op, Ti, To>) {
-        if (detail::tryReduceDimAVX2<op, Ti, To>(out, in, dim, change_nan,
+        if (static_cast<size_t>(idims.elements()) >=
+                detail::minAVX2DimensionalInputElements &&
+            detail::tryReduceDimAVX2<op, Ti, To>(out, in, dim, change_nan,
                                                  nanval, odims, ostrides, idims,
                                                  istrides)) {
             return;

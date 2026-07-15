@@ -27,7 +27,9 @@
 #include <cassert>
 #include <complex>
 #include <cstddef>
+#include <cstring>
 #include <limits>
+#include <type_traits>
 
 namespace arrayfire {
 namespace cpu {
@@ -48,7 +50,7 @@ struct TileDescriptor {
     size_t elements;
 };
 
-template<typename T>
+template<typename Ti, typename To>
 struct ReductionMetadata {
     dim_t output_dims[4];
     dim_t output_strides[4];
@@ -57,9 +59,9 @@ struct ReductionMetadata {
     size_t x_tiles;
 };
 
-template<typename T>
-bool makeReductionMetadata(ReductionMetadata<T> &metadata, Param<T> out,
-                           CParam<T> in, const int dim) noexcept {
+template<typename Ti, typename To>
+bool makeReductionMetadata(ReductionMetadata<Ti, To> &metadata, Param<To> out,
+                           CParam<Ti> in, const int dim) noexcept {
     if (dim < 0 || dim > 3) { return false; }
 
     const af::dim4 idims    = in.dims();
@@ -78,17 +80,17 @@ bool makeReductionMetadata(ReductionMetadata<T> &metadata, Param<T> out,
     }
     metadata.reduction_elements = idims[dim];
 
-    constexpr size_t tile_elements = tile_bytes / sizeof(T);
+    constexpr size_t tile_elements = tile_bytes / sizeof(To);
     const size_t output_x          = static_cast<size_t>(odims[0]);
     metadata.x_tiles = (output_x + tile_elements - 1) / tile_elements;
     return metadata.reduction_elements >= 0;
 }
 
-template<typename T>
+template<typename Ti, typename To>
 inline bool describeTile(TileDescriptor &descriptor,
-                         const ReductionMetadata<T> &metadata,
+                         const ReductionMetadata<Ti, To> &metadata,
                          const size_t tile) noexcept {
-    constexpr size_t tile_elements = tile_bytes / sizeof(T);
+    constexpr size_t tile_elements = tile_bytes / sizeof(To);
     const size_t output_x = static_cast<size_t>(metadata.output_dims[0]);
 
     const size_t x_tile = tile % metadata.x_tiles;
@@ -220,6 +222,174 @@ struct RealVector<double> {
     }
 };
 
+template<typename Ti, typename To>
+struct IntegerVector {
+    static_assert(std::is_integral<Ti>::value && std::is_integral<To>::value,
+                  "integer reduction vectors require integral types");
+    static_assert((std::is_same<Ti, To>::value ||
+                   (sizeof(To) == 4 && sizeof(Ti) < sizeof(To) &&
+                    std::is_signed<Ti>::value == std::is_signed<To>::value)),
+                  "unsupported integer reduction conversion");
+
+    using Type                       = __m256i;
+    static constexpr size_t elements = 32 / sizeof(To);
+
+    AF_CPU_AVX2_TARGET static Type broadcast(const To value) noexcept {
+        if constexpr (sizeof(To) == 1) {
+            char bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            return _mm256_set1_epi8(bits);
+        } else if constexpr (sizeof(To) == 2) {
+            short bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            return _mm256_set1_epi16(bits);
+        } else if constexpr (sizeof(To) == 4) {
+            int bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            return _mm256_set1_epi32(bits);
+        } else {
+            long long bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            return _mm256_set1_epi64x(bits);
+        }
+    }
+
+    template<ReductionOperation op>
+    AF_CPU_AVX2_TARGET static Type initial() noexcept {
+        if constexpr (op == ReductionOperation::Sum) {
+            return _mm256_setzero_si256();
+        } else if constexpr (op == ReductionOperation::Product) {
+            return broadcast(To(1));
+        } else if constexpr (op == ReductionOperation::Minimum) {
+            return broadcast(std::numeric_limits<To>::max());
+        } else {
+            return broadcast(std::numeric_limits<To>::lowest());
+        }
+    }
+
+    AF_CPU_AVX2_TARGET static Type load(const Ti *pointer) noexcept {
+        if constexpr (std::is_same<Ti, To>::value) {
+            return _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(pointer));
+        } else if constexpr (sizeof(Ti) == 1 && std::is_signed<Ti>::value) {
+            const __m128i input =
+                _mm_loadl_epi64(reinterpret_cast<const __m128i *>(pointer));
+            return _mm256_cvtepi8_epi32(input);
+        } else if constexpr (sizeof(Ti) == 1) {
+            const __m128i input =
+                _mm_loadl_epi64(reinterpret_cast<const __m128i *>(pointer));
+            return _mm256_cvtepu8_epi32(input);
+        } else if constexpr (std::is_signed<Ti>::value) {
+            const __m128i input =
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(pointer));
+            return _mm256_cvtepi16_epi32(input);
+        } else {
+            const __m128i input =
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(pointer));
+            return _mm256_cvtepu16_epi32(input);
+        }
+    }
+
+    AF_CPU_AVX2_TARGET static void store(To *pointer, Type value) noexcept {
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(pointer), value);
+    }
+
+    AF_CPU_AVX2_TARGET static Type multiply64(Type lhs, Type rhs) noexcept {
+        const Type low_product = _mm256_mul_epu32(lhs, rhs);
+        const Type lhs_high    = _mm256_srli_epi64(lhs, 32);
+        const Type rhs_high    = _mm256_srli_epi64(rhs, 32);
+        const Type cross = _mm256_add_epi64(_mm256_mul_epu32(lhs_high, rhs),
+                                            _mm256_mul_epu32(lhs, rhs_high));
+        return _mm256_add_epi64(low_product, _mm256_slli_epi64(cross, 32));
+    }
+
+    AF_CPU_AVX2_TARGET static Type add(Type lhs, Type rhs) noexcept {
+        if constexpr (sizeof(To) == 1) {
+            return _mm256_add_epi8(lhs, rhs);
+        } else if constexpr (sizeof(To) == 2) {
+            return _mm256_add_epi16(lhs, rhs);
+        } else if constexpr (sizeof(To) == 4) {
+            return _mm256_add_epi32(lhs, rhs);
+        } else {
+            return _mm256_add_epi64(lhs, rhs);
+        }
+    }
+
+    AF_CPU_AVX2_TARGET static Type multiply(Type lhs, Type rhs) noexcept {
+        if constexpr (sizeof(To) == 2) {
+            return _mm256_mullo_epi16(lhs, rhs);
+        } else if constexpr (sizeof(To) == 4) {
+            return _mm256_mullo_epi32(lhs, rhs);
+        } else {
+            return multiply64(lhs, rhs);
+        }
+    }
+
+    template<ReductionOperation op>
+    AF_CPU_AVX2_TARGET static Type combine(Type input,
+                                           Type accumulator) noexcept {
+        if constexpr (op == ReductionOperation::Sum) {
+            return add(input, accumulator);
+        } else if constexpr (op == ReductionOperation::Product) {
+            return multiply(input, accumulator);
+        } else if constexpr (sizeof(To) == 1) {
+            if constexpr (op == ReductionOperation::Minimum) {
+                if constexpr (std::is_signed<To>::value) {
+                    return _mm256_min_epi8(input, accumulator);
+                } else {
+                    return _mm256_min_epu8(input, accumulator);
+                }
+            } else if constexpr (std::is_signed<To>::value) {
+                return _mm256_max_epi8(input, accumulator);
+            } else {
+                return _mm256_max_epu8(input, accumulator);
+            }
+        } else if constexpr (sizeof(To) == 2) {
+            if constexpr (op == ReductionOperation::Minimum) {
+                if constexpr (std::is_signed<To>::value) {
+                    return _mm256_min_epi16(input, accumulator);
+                } else {
+                    return _mm256_min_epu16(input, accumulator);
+                }
+            } else if constexpr (std::is_signed<To>::value) {
+                return _mm256_max_epi16(input, accumulator);
+            } else {
+                return _mm256_max_epu16(input, accumulator);
+            }
+        } else if constexpr (sizeof(To) == 4) {
+            if constexpr (op == ReductionOperation::Minimum) {
+                if constexpr (std::is_signed<To>::value) {
+                    return _mm256_min_epi32(input, accumulator);
+                } else {
+                    return _mm256_min_epu32(input, accumulator);
+                }
+            } else if constexpr (std::is_signed<To>::value) {
+                return _mm256_max_epi32(input, accumulator);
+            } else {
+                return _mm256_max_epu32(input, accumulator);
+            }
+        } else {
+            Type ordered_input       = input;
+            Type ordered_accumulator = accumulator;
+            if constexpr (!std::is_signed<To>::value) {
+                const Type sign_bit = _mm256_set1_epi64x(
+                    std::numeric_limits<long long>::lowest());
+                ordered_input       = _mm256_xor_si256(input, sign_bit);
+                ordered_accumulator = _mm256_xor_si256(accumulator, sign_bit);
+            }
+            if constexpr (op == ReductionOperation::Minimum) {
+                const Type take_input =
+                    _mm256_cmpgt_epi64(ordered_accumulator, ordered_input);
+                return _mm256_blendv_epi8(accumulator, input, take_input);
+            } else {
+                const Type take_input =
+                    _mm256_cmpgt_epi64(ordered_input, ordered_accumulator);
+                return _mm256_blendv_epi8(accumulator, input, take_input);
+            }
+        }
+    }
+};
+
 template<typename T>
 struct ComplexVector;
 
@@ -328,6 +498,31 @@ AF_CPU_AVX2_TARGET void reduceRealVectors(T *output, const T *input,
     }
 }
 
+template<typename Ti, typename To, ReductionOperation op, size_t vector_count>
+AF_CPU_AVX2_TARGET void reduceIntegerVectors(
+    To *output, const Ti *input, const dim_t reduction_stride,
+    const dim_t reduction_elements) noexcept {
+    using Vector = IntegerVector<Ti, To>;
+    typename Vector::Type accumulators[vector_count];
+    for (size_t vector = 0; vector < vector_count; ++vector) {
+        accumulators[vector] = Vector::template initial<op>();
+    }
+
+    for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
+        const Ti *const row = input + reduced * reduction_stride;
+        for (size_t vector = 0; vector < vector_count; ++vector) {
+            const typename Vector::Type value =
+                Vector::load(row + vector * Vector::elements);
+            accumulators[vector] =
+                Vector::template combine<op>(value, accumulators[vector]);
+        }
+    }
+
+    for (size_t vector = 0; vector < vector_count; ++vector) {
+        Vector::store(output + vector * Vector::elements, accumulators[vector]);
+    }
+}
+
 template<typename T, size_t vector_count>
 AF_CPU_AVX2_TARGET void reduceComplexVectors(
     T *output, const T *input, const dim_t reduction_stride,
@@ -389,6 +584,44 @@ T reduceRealScalar(const T *input, const dim_t reduction_stride,
     return accumulator;
 }
 
+template<typename Ti, typename To, ReductionOperation op>
+To reduceIntegerScalar(const Ti *input, const dim_t reduction_stride,
+                       const dim_t reduction_elements) noexcept {
+    if constexpr (op == ReductionOperation::Sum ||
+                  op == ReductionOperation::Product) {
+        using Unsigned = typename std::make_unsigned<To>::type;
+        Unsigned accumulator =
+            op == ReductionOperation::Sum ? Unsigned(0) : Unsigned(1);
+        for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
+            const To value =
+                static_cast<To>(input[reduced * reduction_stride]);
+            const Unsigned bits = static_cast<Unsigned>(value);
+            if constexpr (op == ReductionOperation::Sum) {
+                accumulator += bits;
+            } else {
+                accumulator *= bits;
+            }
+        }
+        To result;
+        std::memcpy(&result, &accumulator, sizeof(result));
+        return result;
+    } else {
+        To accumulator = op == ReductionOperation::Minimum
+                             ? std::numeric_limits<To>::max()
+                             : std::numeric_limits<To>::lowest();
+        for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
+            const To value =
+                static_cast<To>(input[reduced * reduction_stride]);
+            if constexpr (op == ReductionOperation::Minimum) {
+                accumulator = std::min(value, accumulator);
+            } else {
+                accumulator = std::max(value, accumulator);
+            }
+        }
+        return accumulator;
+    }
+}
+
 template<typename T>
 T reduceComplexScalar(const T *input, const dim_t reduction_stride,
                       const dim_t reduction_elements, const bool change_nan,
@@ -406,7 +639,7 @@ T reduceComplexScalar(const T *input, const dim_t reduction_stride,
 template<typename T, ReductionOperation op>
 AF_CPU_AVX2_TARGET inline void reduceRealTile(
     T *const output_base, const T *const input_base,
-    const ReductionMetadata<T> &metadata, const int dim,
+    const ReductionMetadata<T, T> &metadata, const int dim,
     const TileDescriptor &tile, const bool change_nan,
     const double nanval) noexcept {
     T *const output        = output_base + tile.output_offset;
@@ -451,10 +684,56 @@ AF_CPU_AVX2_TARGET inline void reduceRealTile(
     }
 }
 
+template<typename Ti, typename To, ReductionOperation op>
+AF_CPU_AVX2_TARGET inline void reduceIntegerTile(
+    To *const output_base, const Ti *const input_base,
+    const ReductionMetadata<Ti, To> &metadata, const int dim,
+    const TileDescriptor &tile) noexcept {
+    To *const output       = output_base + tile.output_offset;
+    const Ti *const input  = input_base + tile.input_offset;
+    size_t vector_elements = 0;
+
+    if (metadata.output_strides[0] == 1 && metadata.input_strides[0] == 1) {
+        using Vector              = IntegerVector<Ti, To>;
+        const size_t vector_count = tile.elements / Vector::elements;
+        switch (vector_count) {
+            case 4:
+                reduceIntegerVectors<Ti, To, op, 4>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 3:
+                reduceIntegerVectors<Ti, To, op, 3>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 2:
+                reduceIntegerVectors<Ti, To, op, 2>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 1:
+                reduceIntegerVectors<Ti, To, op, 1>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            default: break;
+        }
+        vector_elements = vector_count * Vector::elements;
+    }
+
+    for (size_t element = vector_elements; element < tile.elements; ++element) {
+        output[element * metadata.output_strides[0]] =
+            reduceIntegerScalar<Ti, To, op>(
+                input + element * metadata.input_strides[0],
+                metadata.input_strides[dim], metadata.reduction_elements);
+    }
+}
+
 template<typename T>
 AF_CPU_AVX2_TARGET inline void reduceComplexTile(
     T *const output_base, const T *const input_base,
-    const ReductionMetadata<T> &metadata, const int dim,
+    const ReductionMetadata<T, T> &metadata, const int dim,
     const TileDescriptor &tile, const bool change_nan,
     const double nanval) noexcept {
     static_assert(sizeof(T) == 2 * sizeof(typename ComplexVector<T>::Real),
@@ -508,7 +787,7 @@ AF_CPU_AVX2_TARGET void reduceRealRange(Param<T> out, CParam<T> in,
                                         const double nanval,
                                         const size_t tile_begin,
                                         const size_t tile_end) noexcept {
-    ReductionMetadata<T> metadata;
+    ReductionMetadata<T, T> metadata;
     const bool valid_metadata = makeReductionMetadata(metadata, out, in, dim);
     assert(valid_metadata);
     if (!valid_metadata) { return; }
@@ -522,13 +801,31 @@ AF_CPU_AVX2_TARGET void reduceRealRange(Param<T> out, CParam<T> in,
     }
 }
 
+template<typename Ti, typename To, ReductionOperation op>
+AF_CPU_AVX2_TARGET void reduceIntegerRange(Param<To> out, CParam<Ti> in,
+                                           const int dim,
+                                           const size_t tile_begin,
+                                           const size_t tile_end) noexcept {
+    ReductionMetadata<Ti, To> metadata;
+    const bool valid_metadata = makeReductionMetadata(metadata, out, in, dim);
+    assert(valid_metadata);
+    if (!valid_metadata) { return; }
+    To *const output      = out.get();
+    const Ti *const input = in.get();
+    for (size_t tile_index = tile_begin; tile_index < tile_end; ++tile_index) {
+        TileDescriptor tile;
+        if (!describeTile(tile, metadata, tile_index)) { break; }
+        reduceIntegerTile<Ti, To, op>(output, input, metadata, dim, tile);
+    }
+}
+
 template<typename T>
 AF_CPU_AVX2_TARGET void reduceComplexRange(Param<T> out, CParam<T> in,
                                            const int dim, const bool change_nan,
                                            const double nanval,
                                            const size_t tile_begin,
                                            const size_t tile_end) noexcept {
-    ReductionMetadata<T> metadata;
+    ReductionMetadata<T, T> metadata;
     const bool valid_metadata = makeReductionMetadata(metadata, out, in, dim);
     assert(valid_metadata);
     if (!valid_metadata) { return; }
@@ -632,6 +929,38 @@ AF_CPU_AVX2_TARGET void reduceDimMaxRangeAVX2(
         out, in, dim, change_nan, nanval, tile_begin, tile_end);
 }
 
+template<typename Ti, typename To>
+AF_CPU_AVX2_TARGET void reduceDimIntegerSumRangeAVX2(
+    Param<To> out, CParam<Ti> in, const int dim, const bool, const double,
+    const size_t tile_begin, const size_t tile_end) noexcept {
+    reduceIntegerRange<Ti, To, ReductionOperation::Sum>(out, in, dim,
+                                                        tile_begin, tile_end);
+}
+
+template<typename Ti, typename To>
+AF_CPU_AVX2_TARGET void reduceDimIntegerProductRangeAVX2(
+    Param<To> out, CParam<Ti> in, const int dim, const bool, const double,
+    const size_t tile_begin, const size_t tile_end) noexcept {
+    reduceIntegerRange<Ti, To, ReductionOperation::Product>(
+        out, in, dim, tile_begin, tile_end);
+}
+
+template<typename T>
+AF_CPU_AVX2_TARGET void reduceDimIntegerMinRangeAVX2(
+    Param<T> out, CParam<T> in, const int dim, const bool, const double,
+    const size_t tile_begin, const size_t tile_end) noexcept {
+    reduceIntegerRange<T, T, ReductionOperation::Minimum>(out, in, dim,
+                                                          tile_begin, tile_end);
+}
+
+template<typename T>
+AF_CPU_AVX2_TARGET void reduceDimIntegerMaxRangeAVX2(
+    Param<T> out, CParam<T> in, const int dim, const bool, const double,
+    const size_t tile_begin, const size_t tile_end) noexcept {
+    reduceIntegerRange<T, T, ReductionOperation::Maximum>(out, in, dim,
+                                                          tile_begin, tile_end);
+}
+
 #else
 
 bool isReduceDimAVX2Compiled() noexcept { return false; }
@@ -666,7 +995,57 @@ void reduceDimMaxRangeAVX2(Param<float>, CParam<float>, int, bool, double,
 void reduceDimMaxRangeAVX2(Param<double>, CParam<double>, int, bool, double,
                            size_t, size_t) noexcept {}
 
+template<typename Ti, typename To>
+void reduceDimIntegerSumRangeAVX2(Param<To>, CParam<Ti>, int, bool, double,
+                                  size_t, size_t) noexcept {}
+
+template<typename Ti, typename To>
+void reduceDimIntegerProductRangeAVX2(Param<To>, CParam<Ti>, int, bool, double,
+                                      size_t, size_t) noexcept {}
+
+template<typename T>
+void reduceDimIntegerMinRangeAVX2(Param<T>, CParam<T>, int, bool, double,
+                                  size_t, size_t) noexcept {}
+
+template<typename T>
+void reduceDimIntegerMaxRangeAVX2(Param<T>, CParam<T>, int, bool, double,
+                                  size_t, size_t) noexcept {}
+
 #endif
+
+#define INSTANTIATE_INTEGER_ARITHMETIC(Ti, To)                              \
+    template void reduceDimIntegerSumRangeAVX2<Ti, To>(                     \
+        Param<To>, CParam<Ti>, int, bool, double, size_t, size_t) noexcept; \
+    template void reduceDimIntegerProductRangeAVX2<Ti, To>(                 \
+        Param<To>, CParam<Ti>, int, bool, double, size_t, size_t) noexcept;
+
+INSTANTIATE_INTEGER_ARITHMETIC(signed char, int)
+INSTANTIATE_INTEGER_ARITHMETIC(unsigned char, unsigned int)
+INSTANTIATE_INTEGER_ARITHMETIC(short, int)
+INSTANTIATE_INTEGER_ARITHMETIC(unsigned short, unsigned int)
+INSTANTIATE_INTEGER_ARITHMETIC(int, int)
+INSTANTIATE_INTEGER_ARITHMETIC(unsigned int, unsigned int)
+INSTANTIATE_INTEGER_ARITHMETIC(long long, long long)
+INSTANTIATE_INTEGER_ARITHMETIC(unsigned long long, unsigned long long)
+
+#undef INSTANTIATE_INTEGER_ARITHMETIC
+
+#define INSTANTIATE_INTEGER_EXTREMA(T)                                    \
+    template void reduceDimIntegerMinRangeAVX2<T>(                        \
+        Param<T>, CParam<T>, int, bool, double, size_t, size_t) noexcept; \
+    template void reduceDimIntegerMaxRangeAVX2<T>(                        \
+        Param<T>, CParam<T>, int, bool, double, size_t, size_t) noexcept;
+
+INSTANTIATE_INTEGER_EXTREMA(signed char)
+INSTANTIATE_INTEGER_EXTREMA(unsigned char)
+INSTANTIATE_INTEGER_EXTREMA(short)
+INSTANTIATE_INTEGER_EXTREMA(unsigned short)
+INSTANTIATE_INTEGER_EXTREMA(int)
+INSTANTIATE_INTEGER_EXTREMA(unsigned int)
+INSTANTIATE_INTEGER_EXTREMA(long long)
+INSTANTIATE_INTEGER_EXTREMA(unsigned long long)
+
+#undef INSTANTIATE_INTEGER_EXTREMA
 
 }  // namespace detail
 }  // namespace kernel
