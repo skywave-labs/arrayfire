@@ -11,11 +11,14 @@
 #include <common/AllocatorInterface.hpp>
 #include <af/defines.h>
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 
 namespace arrayfire {
 namespace cpu {
+constexpr std::size_t kDefaultMemoryAlignment = 64;
+
 template<typename T>
 using uptr = std::unique_ptr<T[], std::function<void(T[])>>;
 

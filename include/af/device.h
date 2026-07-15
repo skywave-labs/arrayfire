@@ -132,6 +132,9 @@ namespace af
     ///
     /// \note The device memory returned by this function is only freed if
     ///       af::freeV2() is called explicitly
+    /// \note With the default CPU memory manager, the returned C pointer is
+    ///       aligned to a 64-byte boundary. Custom memory managers control the
+    ///       alignment of their allocations.
     AFAPI void *allocV2(const size_t bytes);
 #endif
 
@@ -405,6 +408,9 @@ extern "C" {
 
        \returns AF_SUCCESS if a pointer could be allocated. AF_ERR_NO_MEM if
                 there is no memory
+       \note With the default CPU memory manager, the returned C pointer is
+             aligned to a 64-byte boundary. Custom memory managers control the
+             alignment of their allocations.
        \ingroup device_func_alloc
     */
     AFAPI af_err af_alloc_device_v2(void **ptr, const dim_t bytes);

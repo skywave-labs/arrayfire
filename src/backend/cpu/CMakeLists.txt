@@ -48,6 +48,8 @@ target_sources(afcpu
     convolve.hpp
     copy.cpp
     copy.hpp
+    cpu_features.cpp
+    cpu_features.hpp
     device_manager.cpp
     device_manager.hpp
     diagonal.cpp
@@ -225,6 +227,8 @@ target_sources(afcpu
     kernel/fftconvolve.hpp
     kernel/flood_fill.hpp
     kernel/gradient.hpp
+    kernel/gradient_avx2.cpp
+    kernel/gradient_avx2.hpp
     kernel/harris.hpp
     kernel/histogram.hpp
     kernel/hsv_rgb.hpp
@@ -274,6 +278,31 @@ target_sources(afcpu
     kernel/unwrap.hpp
     kernel/wrap.hpp
   )
+
+set(AF_CPU_MSVC_X86 OFF)
+if(MSVC)
+  if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES
+       "^(AMD64|amd64|x64|X86|x86)$")
+      set(AF_CPU_MSVC_X86 ON)
+    endif()
+  elseif(CMAKE_GENERATOR_PLATFORM)
+    if(CMAKE_GENERATOR_PLATFORM MATCHES "^(Win32|x64)$")
+      set(AF_CPU_MSVC_X86 ON)
+    endif()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES
+         "^(AMD64|amd64|x86_64|x64|X86|x86|i[3-6]86)$")
+    set(AF_CPU_MSVC_X86 ON)
+  endif()
+endif()
+
+if(AF_CPU_MSVC_X86)
+  set_source_files_properties(kernel/gradient_avx2.cpp
+    PROPERTIES
+      COMPILE_DEFINITIONS AF_CPU_COMPILE_AVX2
+      COMPILE_OPTIONS "/arch:AVX2")
+endif()
+unset(AF_CPU_MSVC_X86)
 
 if (AF_WITH_CPUID)
   target_compile_definitions(afcpu PRIVATE -DAF_WITH_CPUID)

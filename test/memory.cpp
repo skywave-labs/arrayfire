@@ -15,6 +15,8 @@
 #include <af/memory.h>
 #include <af/traits.hpp>
 
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,7 +39,27 @@ using af::seq;
 using af::span;
 using std::vector;
 
-const size_t step_bytes = 1024;
+const size_t step_bytes                         = 1024;
+constexpr std::uintptr_t cpuAllocationAlignment = 64;
+
+namespace {
+class MemoryStepSizeGuard {
+   public:
+    explicit MemoryStepSizeGuard(size_t step_size)
+        : previous_(af::getMemStepSize()) {
+        af::deviceGC();
+        af::setMemStepSize(step_size);
+    }
+
+    ~MemoryStepSizeGuard() noexcept {
+        af_device_gc();
+        af_set_mem_step_size(previous_);
+    }
+
+   private:
+    size_t previous_;
+};
+}  // namespace
 
 TEST(Memory, Scope) {
     size_t alloc_bytes, alloc_buffers;
@@ -1090,6 +1112,59 @@ TEST(Memory, AfAllocDeviceV2CPUC) {
         // This is the CPU backend so we can assign to the pointer
         *static_cast<float *>(ptr) = 5;
         ASSERT_SUCCESS(af_free_device_v2(ptr));
+    }
+}
+
+TEST(Memory, AfAllocDeviceV2CPUAlignment) {
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+
+    if (active_backend == AF_BACKEND_CPU) {
+        cleanSlate();
+        MemoryStepSizeGuard step_size_guard(1);
+        constexpr std::array<size_t, 10> allocation_sizes = {
+            1, 7, 16, 31, 64, 127, 1023, 1024, 4097, 65537};
+
+        for (const size_t bytes : allocation_sizes) {
+            void *ptr;
+            ASSERT_SUCCESS(af_alloc_device_v2(&ptr, bytes));
+            EXPECT_EQ(
+                reinterpret_cast<std::uintptr_t>(ptr) % cpuAllocationAlignment,
+                0u)
+                << "allocation size: " << bytes;
+
+            auto *data      = static_cast<unsigned char *>(ptr);
+            data[0]         = 0x5A;
+            data[bytes - 1] = 0xA5;
+            ASSERT_SUCCESS(af_free_device_v2(ptr));
+        }
+    }
+}
+
+TEST(Memory, AfAllocDeviceV2CPUAlignmentAfterCacheReuse) {
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+
+    if (active_backend == AF_BACKEND_CPU) {
+        cleanSlate();
+        MemoryStepSizeGuard step_size_guard(1);
+        constexpr size_t bytes = 4097;
+
+        void *first;
+        ASSERT_SUCCESS(af_alloc_device_v2(&first, bytes));
+        ASSERT_SUCCESS(af_free_device_v2(first));
+
+        size_t alloc_bytes, alloc_buffers, lock_bytes, lock_buffers;
+        deviceMemInfo(&alloc_bytes, &alloc_buffers, &lock_bytes, &lock_buffers);
+        const bool cache_enabled = alloc_buffers != 0;
+
+        void *reused;
+        ASSERT_SUCCESS(af_alloc_device_v2(&reused, bytes));
+        if (cache_enabled) { EXPECT_EQ(reused, first); }
+        EXPECT_EQ(
+            reinterpret_cast<std::uintptr_t>(reused) % cpuAllocationAlignment,
+            0u);
+        ASSERT_SUCCESS(af_free_device_v2(reused));
     }
 }
 

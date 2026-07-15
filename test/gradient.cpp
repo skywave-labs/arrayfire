@@ -18,13 +18,81 @@
 #include <string>
 #include <vector>
 
+using af::array;
 using af::cdouble;
 using af::cfloat;
 using af::dim4;
 using af::dtype_traits;
+using af::seq;
+using af::span;
 using std::endl;
 using std::string;
 using std::vector;
+
+template<typename T>
+T gradientInputValue(size_t index) {
+    return static_cast<T>(static_cast<int>(index % 29) - 14);
+}
+
+template<>
+cfloat gradientInputValue<cfloat>(size_t index) {
+    return cfloat(static_cast<float>(static_cast<int>(index % 29) - 14),
+                  static_cast<float>(static_cast<int>(index % 17) - 8));
+}
+
+template<>
+cdouble gradientInputValue<cdouble>(size_t index) {
+    return cdouble(static_cast<double>(static_cast<int>(index % 29) - 14),
+                   static_cast<double>(static_cast<int>(index % 17) - 8));
+}
+
+template<typename T>
+void checkGradientReference(const array& input, const vector<T>& input_values) {
+    const dim4 dims = input.dims();
+    ASSERT_EQ(static_cast<size_t>(dims.elements()), input_values.size());
+
+    array grad0;
+    array grad1;
+    af::grad(grad0, grad1, input);
+
+    vector<T> actual0(input_values.size());
+    vector<T> actual1(input_values.size());
+    grad0.host(actual0.data());
+    grad1.host(actual1.data());
+
+    const auto offset = [dims](dim_t x, dim_t y, dim_t z, dim_t w) {
+        return static_cast<size_t>(x +
+                                   dims[0] * (y + dims[1] * (z + dims[2] * w)));
+    };
+
+    for (dim_t w = 0; w < dims[3]; ++w) {
+        for (dim_t z = 0; z < dims[2]; ++z) {
+            for (dim_t y = 0; y < dims[1]; ++y) {
+                const dim_t previous_y = y == 0 ? y : y - 1;
+                const dim_t next_y     = y + 1 == dims[1] ? y : y + 1;
+                const T y_scale = (y == 0 || y + 1 == dims[1]) ? T(1) : T(0.5);
+
+                for (dim_t x = 0; x < dims[0]; ++x) {
+                    const dim_t previous_x = x == 0 ? x : x - 1;
+                    const dim_t next_x     = x + 1 == dims[0] ? x : x + 1;
+                    const T x_scale =
+                        (x == 0 || x + 1 == dims[0]) ? T(1) : T(0.5);
+                    const size_t index = offset(x, y, z, w);
+
+                    const T expected0 =
+                        x_scale * (input_values[offset(next_x, y, z, w)] -
+                                   input_values[offset(previous_x, y, z, w)]);
+                    const T expected1 =
+                        y_scale * (input_values[offset(x, next_y, z, w)] -
+                                   input_values[offset(x, previous_y, z, w)]);
+
+                    ASSERT_EQ(expected0, actual0[index]) << "at: " << index;
+                    ASSERT_EQ(expected1, actual1[index]) << "at: " << index;
+                }
+            }
+        }
+    }
+}
 
 template<typename T>
 class Grad : public ::testing::Test {
@@ -117,11 +185,90 @@ GRAD_INIT(Grad0, grad, 0, 1);
 GRAD_INIT(Grad1, grad2D, 0, 1);
 GRAD_INIT(Grad2, grad3D, 0, 1);
 
+TYPED_TEST(Grad, VectorBoundariesAndBatches) {
+    SUPPORTED_TYPE_CHECK(TypeParam);
+
+    constexpr dim_t widths[]  = {1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33};
+    constexpr dim_t heights[] = {1, 2, 3, 5};
+    for (const dim_t width : widths) {
+        for (const dim_t height : heights) {
+            const dim4 dims(width, height, 2, 2);
+            vector<TypeParam> input_values(
+                static_cast<size_t>(dims.elements()));
+            for (size_t i = 0; i < input_values.size(); ++i) {
+                input_values[i] = gradientInputValue<TypeParam>(i);
+            }
+
+            const array input(dims, input_values.data());
+            checkGradientReference(input, input_values);
+        }
+    }
+}
+
+TYPED_TEST(Grad, OffsetViewWithNonContiguousRows) {
+    SUPPORTED_TYPE_CHECK(TypeParam);
+
+    const dim4 parent_dims(41, 11, 2, 2);
+    vector<TypeParam> parent_values(
+        static_cast<size_t>(parent_dims.elements()));
+    for (size_t i = 0; i < parent_values.size(); ++i) {
+        parent_values[i] = gradientInputValue<TypeParam>(i);
+    }
+
+    const array parent(parent_dims, parent_values.data());
+    const array input = parent(seq(1, 33), seq(1, 9), span, span);
+    vector<TypeParam> input_values(static_cast<size_t>(input.elements()));
+    input.host(input_values.data());
+
+    checkGradientReference(input, input_values);
+}
+
+TYPED_TEST(Grad, StridedColumnsUseScalarFallback) {
+    SUPPORTED_TYPE_CHECK(TypeParam);
+
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+    if (active_backend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU stride-zero fallback regression";
+    }
+
+    const dim4 parent_dims(41, 11, 2, 2);
+    vector<TypeParam> parent_values(
+        static_cast<size_t>(parent_dims.elements()));
+    for (size_t i = 0; i < parent_values.size(); ++i) {
+        parent_values[i] = gradientInputValue<TypeParam>(i);
+    }
+
+    const array parent(parent_dims, parent_values.data());
+    const array input = parent(seq(1, 33, 2), seq(1, 9), span, span);
+    vector<TypeParam> input_values(static_cast<size_t>(input.elements()));
+    input.host(input_values.data());
+
+    checkGradientReference(input, input_values);
+}
+
+TYPED_TEST(Grad, ParallelRows) {
+    SUPPORTED_TYPE_CHECK(TypeParam);
+
+    af_backend active_backend;
+    ASSERT_SUCCESS(af_get_active_backend(&active_backend));
+    if (active_backend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU row-scheduling regression";
+    }
+
+    const dim4 dims(257, 513);
+    vector<TypeParam> input_values(static_cast<size_t>(dims.elements()));
+    for (size_t i = 0; i < input_values.size(); ++i) {
+        input_values[i] = gradientInputValue<TypeParam>(i);
+    }
+
+    const array input(dims, input_values.data());
+    checkGradientReference(input, input_values);
+}
+
 /////////////////////////////////////// CPP
 //////////////////////////////////////////////
 //
-
-using af::array;
 
 TEST(Grad, CPP) {
     const unsigned resultIdx0 = 0;

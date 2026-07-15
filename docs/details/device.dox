@@ -101,6 +101,9 @@ appropriate memory type.
 
 CPU Backend
 -----------
+With the default CPU memory manager, allocations are aligned to a 64-byte
+boundary. Custom memory managers control the alignment of their allocations.
+
 \snippet test/memory.cpp ex_alloc_v2_cpu
 
 CUDA Backend
