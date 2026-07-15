@@ -85,6 +85,27 @@ struct MinMaxOp<af_max_t, T> {
     void operator()(T val, uint idx) { consider(val, cabs(val), idx); }
 };
 
+#if defined(_MSC_VER)
+#define AF_CPU_IREDUCE_ALWAYS_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define AF_CPU_IREDUCE_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define AF_CPU_IREDUCE_ALWAYS_INLINE inline
+#endif
+
+template<af_op_t op, typename T>
+AF_CPU_IREDUCE_ALWAYS_INLINE void ireduce_line(
+    T *const out, uint *const loc, const dim_t outOffset, const T *const in,
+    const dim_t inOffset, const dim_t stride, const int lim) {
+    MinMaxOp<op, T> Op(in[inOffset], 0);
+    for (dim_t i = 0; i < lim; i++) { Op(in[inOffset + i * stride], i); }
+
+    out[outOffset] = Op.m_val;
+    loc[outOffset] = Op.m_idx;
+}
+
+#undef AF_CPU_IREDUCE_ALWAYS_INLINE
+
 template<af_op_t op, typename T, int D>
 struct ireduce_dim {
     void operator()(Param<T> output, Param<uint> locParam,

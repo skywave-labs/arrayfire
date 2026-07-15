@@ -652,3 +652,242 @@ TEST(IReduceDimParallel, EvaluatesLargeLazyInputBeforeWorkerReads) {
         EXPECT_EQ(0u, hostMaxIndices[line]);
     }
 }
+
+TEST(IReduceRaggedParallel, StridedLengthsUseLogicalCoordinates) {
+    const float inputValues[] = {1.f, 2.f, 3.f, 4.f, 10.f, 20.f,
+                                 30.f, 40.f, 5.f, 6.f, 7.f, 8.f};
+    const unsigned parentLengths[] = {1, 99, 2, 99, 3, 99};
+    const array input(dim4(4, 3), inputValues);
+    const array lengthParent(dim4(2, 3), parentLengths);
+    const array lengths = lengthParent(0, span);
+    ASSERT_EQ(1, lengths.dims(0));
+    ASSERT_EQ(3, lengths.dims(1));
+    ASSERT_EQ(2, af::getStrides(lengths)[1]);
+
+    array values;
+    array indices;
+    af::max(values, indices, input, lengths, 0);
+
+    const vector<float> expectedValues{1.f, 20.f, 7.f};
+    const vector<unsigned> expectedIndices{0, 1, 2};
+    EXPECT_VEC_ARRAY_EQ(expectedValues, dim4(1, 3), values);
+    EXPECT_VEC_ARRAY_EQ(expectedIndices, dim4(1, 3), indices);
+}
+
+TEST(IReduceRaggedParallel,
+     MixedLengthsAndGappedViewsAcrossAllDimensions) {
+    const float negInf = -std::numeric_limits<float>::infinity();
+    for (int dim = 0; dim < 4; ++dim) {
+        const dim_t reducedElements = dimensionalDims[dim];
+        dim4 outputDims             = dimensionalDims;
+        outputDims[dim]             = 1;
+        const size_t lineCount = static_cast<size_t>(outputDims.elements());
+        vector<float> inputValues(dimensionalDims.elements());
+        vector<unsigned> lengths(lineCount);
+
+        for (size_t line = 0; line < lineCount; ++line) {
+            for (dim_t reduced = 0; reduced < reducedElements; ++reduced) {
+                inputValues[lineElementIndex(dimensionalDims, dim, line,
+                                             reduced)] =
+                    static_cast<float>(reduced);
+            }
+
+            switch (line % 5) {
+                case 0:
+                    lengths[line] = 0;
+                    inputValues[lineElementIndex(dimensionalDims, dim, line,
+                                                 0)] = negInf;
+                    break;
+                case 1: lengths[line] = 1; break;
+                case 2:
+                    lengths[line] =
+                        static_cast<unsigned>(reducedElements / 2);
+                    break;
+                case 3:
+                    lengths[line] = static_cast<unsigned>(reducedElements);
+                    break;
+                default:
+                    lengths[line] =
+                        static_cast<unsigned>(reducedElements + 17);
+                    break;
+            }
+        }
+
+        const array input = makeGappedView(
+            array(dimensionalDims, inputValues.data()));
+        const array raggedLengths =
+            makeGappedView(array(outputDims, lengths.data()));
+        ASSERT_GT(af::getOffset(input), 0);
+        ASSERT_GT(af::getOffset(raggedLengths), 0);
+
+        array values;
+        array indices;
+        af::max(values, indices, input, raggedLengths, dim);
+        const vector<float> hostValues = hostVector<float>(values);
+        const vector<unsigned> hostIndices = hostVector<unsigned>(indices);
+
+        for (size_t line = 0; line < lineCount; ++line) {
+            const dim_t length = std::min(
+                reducedElements, static_cast<dim_t>(lengths[line]));
+            if (length == 0) {
+                EXPECT_EQ(negInf, hostValues[line]);
+                EXPECT_EQ(0u, hostIndices[line]);
+            } else {
+                EXPECT_EQ(static_cast<float>(length - 1), hostValues[line]);
+                EXPECT_EQ(static_cast<unsigned>(length - 1),
+                          hostIndices[line]);
+            }
+        }
+    }
+}
+
+TEST(IReduceRaggedParallel, TruncatedRealPrefixesPreserveScalarSemantics) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    const dim4 dims(256, 2048);
+    const dim_t reducedElements = dims[0];
+    const size_t lineCount      = static_cast<size_t>(dims[1]);
+    const unsigned prefixLength = 192;
+    const float nan             = std::numeric_limits<float>::quiet_NaN();
+    const float negInf          = -std::numeric_limits<float>::infinity();
+    vector<float> inputValues(dims.elements(), -2.f);
+    vector<unsigned> lengths(lineCount, prefixLength);
+
+    for (size_t line = 0; line < lineCount; ++line) {
+        inputValues[lineElementIndex(dims, 0, line,
+                                     reducedElements - 1)] = 100.f;
+        switch (line % 5) {
+            case 0:
+                inputValues[lineElementIndex(dims, 0, line, 1)] = -0.f;
+                inputValues[lineElementIndex(dims, 0, line, 7)] = 0.f;
+                break;
+            case 1:
+                for (unsigned reduced = 0; reduced < prefixLength;
+                     ++reduced) {
+                    inputValues[lineElementIndex(dims, 0, line, reduced)] =
+                        nan;
+                }
+                break;
+            case 2:
+                inputValues[lineElementIndex(dims, 0, line, 0)] = nan;
+                inputValues[lineElementIndex(dims, 0, line, 3)] = 5.f;
+                inputValues[lineElementIndex(dims, 0, line, 10)] = 5.f;
+                break;
+            case 3:
+                inputValues[lineElementIndex(dims, 0, line, 0)] = nan;
+                for (unsigned reduced = 1; reduced < prefixLength;
+                     ++reduced) {
+                    inputValues[lineElementIndex(dims, 0, line, reduced)] =
+                        negInf;
+                }
+                break;
+            default:
+                lengths[line] = 0;
+                inputValues[lineElementIndex(dims, 0, line, 0)] = negInf;
+                break;
+        }
+    }
+
+    array values;
+    array indices;
+    af::max(values, indices, array(dims, inputValues.data()),
+            array(dim4(1, static_cast<dim_t>(lineCount)), lengths.data()), 0);
+    const vector<float> hostValues = hostVector<float>(values);
+    const vector<unsigned> hostIndices = hostVector<unsigned>(indices);
+
+    for (size_t line = 0; line < lineCount; ++line) {
+        switch (line % 5) {
+            case 0:
+                EXPECT_EQ(0.f, hostValues[line]);
+                EXPECT_TRUE(std::signbit(hostValues[line]));
+                EXPECT_EQ(1u, hostIndices[line]);
+                break;
+            case 1:
+            case 3:
+            case 4:
+                EXPECT_EQ(negInf, hostValues[line]);
+                EXPECT_EQ(0u, hostIndices[line]);
+                break;
+            default:
+                EXPECT_EQ(5.f, hostValues[line]);
+                EXPECT_EQ(3u, hostIndices[line]);
+                break;
+        }
+    }
+}
+
+TEST(IReduceRaggedParallel, ComplexPrefixesPreserveMagnitudeAndNaNEvents) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    const dim4 dims(256, 2048);
+    const dim_t reducedElements = dims[0];
+    const size_t lineCount      = static_cast<size_t>(dims[1]);
+    const unsigned prefixLength = 192;
+    const float nan             = std::numeric_limits<float>::quiet_NaN();
+    const float inf             = std::numeric_limits<float>::infinity();
+    const cfloat ordinaryNaN(nan, 0.f);
+    const cfloat rawEvent(inf, nan);
+    vector<cfloat> inputValues(dims.elements(), cfloat(.25f, 0.f));
+    vector<unsigned> lengths(lineCount, prefixLength);
+
+    for (size_t line = 0; line < lineCount; ++line) {
+        inputValues[lineElementIndex(dims, 0, line, 1)] = cfloat(4.f, 0.f);
+        inputValues[lineElementIndex(dims, 0, line, 7)] = cfloat(0.f, 4.f);
+        inputValues[lineElementIndex(dims, 0, line,
+                                     reducedElements - 1)] =
+            cfloat(100.f, 0.f);
+    }
+    for (size_t line = 0; line < 3; ++line) {
+        for (unsigned reduced = 0; reduced < prefixLength; ++reduced) {
+            inputValues[lineElementIndex(dims, 0, line, reduced)] =
+                ordinaryNaN;
+        }
+    }
+    inputValues[lineElementIndex(dims, 0, 0, 0)] = rawEvent;
+    inputValues[lineElementIndex(dims, 0, 1, 7)] = rawEvent;
+
+    array values;
+    array indices;
+    af::max(values, indices, array(dims, inputValues.data()),
+            array(dim4(1, static_cast<dim_t>(lineCount)), lengths.data()), 0);
+    const vector<cfloat> hostValues = hostVector<cfloat>(values);
+    const vector<unsigned> hostIndices = hostVector<unsigned>(indices);
+
+    expectRawInfNaN(hostValues[0]);
+    EXPECT_EQ(0u, hostIndices[0]);
+    expectRawInfNaN(hostValues[1]);
+    EXPECT_EQ(7u, hostIndices[1]);
+    expectComplexEqual(cfloat(0.f, 0.f), hostValues[2]);
+    EXPECT_EQ(0u, hostIndices[2]);
+
+    for (size_t line = 3; line < lineCount; ++line) {
+        expectComplexEqual(cfloat(4.f, 0.f), hostValues[line]);
+        EXPECT_EQ(1u, hostIndices[line]);
+    }
+}
+
+TEST(IReduceRaggedParallel, EvaluatesLazyInputAndVariableLengths) {
+    const int dim               = 2;
+    const dim_t reducedElements = dimensionalDims[dim];
+    dim4 outputDims             = dimensionalDims;
+    outputDims[dim]             = 1;
+    const array lazyInput = af::range(dimensionalDims, dim) * 2.f - 3.f;
+    const array lazyLengths =
+        (af::range(outputDims, 0, af::dtype::u32) %
+         static_cast<unsigned>(reducedElements)) +
+        1;
+
+    array values;
+    array indices;
+    af::max(values, indices, lazyInput, lazyLengths, dim);
+    const vector<float> hostValues = hostVector<float>(values);
+    const vector<unsigned> hostIndices = hostVector<unsigned>(indices);
+
+    for (size_t line = 0; line < hostValues.size(); ++line) {
+        const unsigned length =
+            static_cast<unsigned>(line % outputDims[0]) %
+                static_cast<unsigned>(reducedElements) +
+            1;
+        EXPECT_EQ(2.f * static_cast<float>(length - 1) - 3.f,
+                  hostValues[line]);
+        EXPECT_EQ(length - 1, hostIndices[line]);
+    }
+}
