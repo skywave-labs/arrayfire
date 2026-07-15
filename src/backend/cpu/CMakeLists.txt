@@ -274,6 +274,8 @@ target_sources(afcpu
     kernel/tile.hpp
     kernel/transform.hpp
     kernel/transpose.hpp
+    kernel/transpose_avx2.cpp
+    kernel/transpose_avx2.hpp
     kernel/triangle.hpp
     kernel/unwrap.hpp
     kernel/wrap.hpp
@@ -297,7 +299,9 @@ if(MSVC)
 endif()
 
 if(AF_CPU_MSVC_X86)
-  set_source_files_properties(kernel/gradient_avx2.cpp
+  set_source_files_properties(
+    kernel/gradient_avx2.cpp
+    kernel/transpose_avx2.cpp
     PROPERTIES
       COMPILE_DEFINITIONS AF_CPU_COMPILE_AVX2
       COMPILE_OPTIONS "/arch:AVX2")
