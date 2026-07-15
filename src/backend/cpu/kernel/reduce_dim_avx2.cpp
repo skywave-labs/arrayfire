@@ -27,6 +27,7 @@
 #include <cassert>
 #include <complex>
 #include <cstddef>
+#include <limits>
 
 namespace arrayfire {
 namespace cpu {
@@ -39,7 +40,7 @@ namespace {
 
 constexpr size_t tile_bytes = 128;
 
-enum class ReductionOperation { Sum, Product };
+enum class ReductionOperation { Sum, Product, Minimum, Maximum };
 
 struct TileDescriptor {
     dim_t input_offset;
@@ -126,8 +127,12 @@ struct RealVector<float> {
     AF_CPU_AVX2_TARGET static Type initial() noexcept {
         if constexpr (op == ReductionOperation::Sum) {
             return _mm256_setzero_ps();
-        } else {
+        } else if constexpr (op == ReductionOperation::Product) {
             return _mm256_set1_ps(1.0F);
+        } else if constexpr (op == ReductionOperation::Minimum) {
+            return _mm256_set1_ps(std::numeric_limits<float>::infinity());
+        } else {
+            return _mm256_set1_ps(-std::numeric_limits<float>::infinity());
         }
     }
 
@@ -150,8 +155,16 @@ struct RealVector<float> {
                                            Type accumulator) noexcept {
         if constexpr (op == ReductionOperation::Sum) {
             return _mm256_add_ps(input, accumulator);
-        } else {
+        } else if constexpr (op == ReductionOperation::Product) {
             return _mm256_mul_ps(input, accumulator);
+        } else if constexpr (op == ReductionOperation::Minimum) {
+            const Type keep_accumulator =
+                _mm256_cmp_ps(accumulator, input, _CMP_LT_OQ);
+            return _mm256_blendv_ps(input, accumulator, keep_accumulator);
+        } else {
+            const Type keep_accumulator =
+                _mm256_cmp_ps(input, accumulator, _CMP_LT_OQ);
+            return _mm256_blendv_ps(input, accumulator, keep_accumulator);
         }
     }
 };
@@ -165,8 +178,12 @@ struct RealVector<double> {
     AF_CPU_AVX2_TARGET static Type initial() noexcept {
         if constexpr (op == ReductionOperation::Sum) {
             return _mm256_setzero_pd();
-        } else {
+        } else if constexpr (op == ReductionOperation::Product) {
             return _mm256_set1_pd(1.0);
+        } else if constexpr (op == ReductionOperation::Minimum) {
+            return _mm256_set1_pd(std::numeric_limits<double>::infinity());
+        } else {
+            return _mm256_set1_pd(-std::numeric_limits<double>::infinity());
         }
     }
 
@@ -189,8 +206,16 @@ struct RealVector<double> {
                                            Type accumulator) noexcept {
         if constexpr (op == ReductionOperation::Sum) {
             return _mm256_add_pd(input, accumulator);
-        } else {
+        } else if constexpr (op == ReductionOperation::Product) {
             return _mm256_mul_pd(input, accumulator);
+        } else if constexpr (op == ReductionOperation::Minimum) {
+            const Type keep_accumulator =
+                _mm256_cmp_pd(accumulator, input, _CMP_LT_OQ);
+            return _mm256_blendv_pd(input, accumulator, keep_accumulator);
+        } else {
+            const Type keep_accumulator =
+                _mm256_cmp_pd(input, accumulator, _CMP_LT_OQ);
+            return _mm256_blendv_pd(input, accumulator, keep_accumulator);
         }
     }
 };
@@ -284,7 +309,15 @@ AF_CPU_AVX2_TARGET void reduceRealVectors(T *output, const T *input,
         for (size_t vector = 0; vector < vector_count; ++vector) {
             typename Vector::Type value =
                 Vector::load(row + vector * Vector::elements);
-            if (change_nan) { value = Vector::replaceNaN(value, nanval); }
+            if constexpr (op == ReductionOperation::Minimum) {
+                value = Vector::replaceNaN(
+                    value, std::numeric_limits<T>::infinity());
+            } else if constexpr (op == ReductionOperation::Maximum) {
+                value = Vector::replaceNaN(
+                    value, -std::numeric_limits<T>::infinity());
+            } else if (change_nan) {
+                value = Vector::replaceNaN(value, nanval);
+            }
             accumulators[vector] =
                 Vector::template combine<op>(value, accumulators[vector]);
         }
@@ -325,13 +358,31 @@ template<typename T, ReductionOperation op>
 T reduceRealScalar(const T *input, const dim_t reduction_stride,
                    const dim_t reduction_elements, const bool change_nan,
                    const T nanval) noexcept {
-    T accumulator = op == ReductionOperation::Sum ? T(0) : T(1);
+    T accumulator;
+    if constexpr (op == ReductionOperation::Sum) {
+        accumulator = T(0);
+    } else if constexpr (op == ReductionOperation::Product) {
+        accumulator = T(1);
+    } else if constexpr (op == ReductionOperation::Minimum) {
+        accumulator = std::numeric_limits<T>::infinity();
+    } else {
+        accumulator = -std::numeric_limits<T>::infinity();
+    }
     for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
         T value = input[reduced * reduction_stride];
-        if (change_nan && value != value) { value = nanval; }
-        if constexpr (op == ReductionOperation::Sum) {
+        if constexpr (op == ReductionOperation::Minimum) {
+            if (value != value) { value = std::numeric_limits<T>::infinity(); }
+            accumulator = std::min(value, accumulator);
+        } else if constexpr (op == ReductionOperation::Maximum) {
+            if (value != value) {
+                value = -std::numeric_limits<T>::infinity();
+            }
+            accumulator = std::max(value, accumulator);
+        } else if constexpr (op == ReductionOperation::Sum) {
+            if (change_nan && value != value) { value = nanval; }
             accumulator = value + accumulator;
         } else {
+            if (change_nan && value != value) { value = nanval; }
             accumulator = value * accumulator;
         }
     }
@@ -549,6 +600,38 @@ AF_CPU_AVX2_TARGET void reduceDimProductRangeAVX2(
         out, in, dim, change_nan, nanval, tile_begin, tile_end);
 }
 
+AF_CPU_AVX2_TARGET void reduceDimMinRangeAVX2(
+    Param<float> out, CParam<float> in, const int dim, const bool change_nan,
+    const double nanval, const size_t tile_begin,
+    const size_t tile_end) noexcept {
+    reduceRealRange<float, ReductionOperation::Minimum>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
+}
+
+AF_CPU_AVX2_TARGET void reduceDimMinRangeAVX2(
+    Param<double> out, CParam<double> in, const int dim, const bool change_nan,
+    const double nanval, const size_t tile_begin,
+    const size_t tile_end) noexcept {
+    reduceRealRange<double, ReductionOperation::Minimum>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
+}
+
+AF_CPU_AVX2_TARGET void reduceDimMaxRangeAVX2(
+    Param<float> out, CParam<float> in, const int dim, const bool change_nan,
+    const double nanval, const size_t tile_begin,
+    const size_t tile_end) noexcept {
+    reduceRealRange<float, ReductionOperation::Maximum>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
+}
+
+AF_CPU_AVX2_TARGET void reduceDimMaxRangeAVX2(
+    Param<double> out, CParam<double> in, const int dim, const bool change_nan,
+    const double nanval, const size_t tile_begin,
+    const size_t tile_end) noexcept {
+    reduceRealRange<double, ReductionOperation::Maximum>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
+}
+
 #else
 
 bool isReduceDimAVX2Compiled() noexcept { return false; }
@@ -570,6 +653,18 @@ void reduceDimProductRangeAVX2(Param<float>, CParam<float>, int, bool, double,
 
 void reduceDimProductRangeAVX2(Param<double>, CParam<double>, int, bool, double,
                                size_t, size_t) noexcept {}
+
+void reduceDimMinRangeAVX2(Param<float>, CParam<float>, int, bool, double,
+                           size_t, size_t) noexcept {}
+
+void reduceDimMinRangeAVX2(Param<double>, CParam<double>, int, bool, double,
+                           size_t, size_t) noexcept {}
+
+void reduceDimMaxRangeAVX2(Param<float>, CParam<float>, int, bool, double,
+                           size_t, size_t) noexcept {}
+
+void reduceDimMaxRangeAVX2(Param<double>, CParam<double>, int, bool, double,
+                           size_t, size_t) noexcept {}
 
 #endif
 

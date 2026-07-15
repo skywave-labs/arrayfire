@@ -45,10 +45,16 @@ template<typename T>
 constexpr bool isAVX2ProductType =
     std::is_same<T, float>::value || std::is_same<T, double>::value;
 
+template<typename T>
+constexpr bool isAVX2ExtremaType =
+    std::is_same<T, float>::value || std::is_same<T, double>::value;
+
 template<af_op_t op, typename Ti, typename To>
 constexpr bool isAVX2ReduceSupported =
     (op == af_add_t && std::is_same<Ti, To>::value && isAVX2SumType<Ti>) ||
-    (op == af_mul_t && std::is_same<Ti, To>::value && isAVX2ProductType<Ti>);
+    (op == af_mul_t && std::is_same<Ti, To>::value && isAVX2ProductType<Ti>) ||
+    ((op == af_min_t || op == af_max_t) &&
+     std::is_same<Ti, To>::value && isAVX2ExtremaType<Ti>);
 
 template<af_op_t op, typename Ti, typename To>
 AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
@@ -59,8 +65,13 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
         op == af_add_t && std::is_same<Ti, To>::value && isAVX2SumType<Ti>;
     constexpr bool supported_product =
         op == af_mul_t && std::is_same<Ti, To>::value && isAVX2ProductType<Ti>;
+    constexpr bool supported_minimum =
+        op == af_min_t && std::is_same<Ti, To>::value && isAVX2ExtremaType<Ti>;
+    constexpr bool supported_maximum =
+        op == af_max_t && std::is_same<Ti, To>::value && isAVX2ExtremaType<Ti>;
 
-    if constexpr (!supported_sum && !supported_product) {
+    if constexpr (!supported_sum && !supported_product && !supported_minimum &&
+                  !supported_maximum) {
         return false;
     } else {
         constexpr size_t vector_bytes             = 32;
@@ -119,10 +130,16 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
                              if constexpr (supported_sum) {
                                  reduceDimSumRangeAVX2(out, in, dim, change_nan,
                                                        nanval, begin, end);
-                             } else {
+                             } else if constexpr (supported_product) {
                                  reduceDimProductRangeAVX2(out, in, dim,
                                                            change_nan, nanval,
                                                            begin, end);
+                             } else if constexpr (supported_minimum) {
+                                 reduceDimMinRangeAVX2(out, in, dim, change_nan,
+                                                      nanval, begin, end);
+                             } else {
+                                 reduceDimMaxRangeAVX2(out, in, dim, change_nan,
+                                                      nanval, begin, end);
                              }
                          });
         return true;
