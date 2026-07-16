@@ -76,7 +76,8 @@ constexpr bool isAVX2SumPair =
 template<typename Ti, typename To>
 constexpr bool isAVX2ProductPair =
     (std::is_same<Ti, To>::value &&
-     (std::is_same<Ti, float>::value || std::is_same<Ti, double>::value)) ||
+     (std::is_same<Ti, float>::value || std::is_same<Ti, double>::value ||
+      std::is_same<Ti, cfloat>::value || std::is_same<Ti, cdouble>::value)) ||
     isF16CHalfArithmeticPair<Ti, To> ||
     isAVX2IntegralArithmeticPair<Ti, To>;
 
@@ -110,6 +111,10 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
         (std::is_same<Ti, To>::value && isAVX2IntegralExtremaType<Ti>);
     constexpr bool supported_half =
         isF16CHalfArithmeticPair<Ti, To> || isF16CHalfExtremaPair<Ti, To>;
+    constexpr bool supported_complex_product =
+        supported_product && std::is_same<Ti, To>::value &&
+        (std::is_same<Ti, cfloat>::value ||
+         std::is_same<Ti, cdouble>::value);
 
     if constexpr (!supported_sum && !supported_product && !supported_minimum &&
                   !supported_maximum) {
@@ -200,6 +205,36 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
                                           begin, end);
                 }
             });
+
+        if constexpr (supported_complex_product) {
+            // The four-operation SIMD formula matches std::complex until an
+            // intermediate result is NaN. That state is absorbing for the
+            // formula, so the final output identifies every line that needs
+            // the platform's scalar Inf/NaN recovery semantics.
+            const size_t min_lines_per_task =
+                std::max<size_t>(1, target_elements_per_task /
+                                       std::max<size_t>(1, reduced_elements));
+            To *const output_base      = out.get();
+            const Ti *const input_base = in.get();
+            parallelForEach(
+                odims, min_lines_per_task,
+                [=](const dim_t x, const dim_t y, const dim_t z,
+                    const dim_t w) {
+                    const dim_t output_offset =
+                        x * ostrides[0] + y * ostrides[1] +
+                        z * ostrides[2] + w * ostrides[3];
+                    To *const output = output_base + output_offset;
+                    if (*output != *output) {
+                        const dim_t input_offset =
+                            x * istrides[0] + y * istrides[1] +
+                            z * istrides[2] + w * istrides[3];
+                        *output = reduceDimComplexProductScalar(
+                            input_base + input_offset, istrides[dim],
+                            idims[dim], change_nan,
+                            static_cast<typename To::value_type>(nanval));
+                    }
+                });
+        }
         return true;
     }
 }
