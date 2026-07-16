@@ -270,6 +270,7 @@ target_sources(afcpu
     kernel/sort.hpp
     kernel/sort_by_key.hpp
     kernel/sort_helper.hpp
+    kernel/sort_utils.hpp
     kernel/sparse.hpp
     kernel/sparse_arith.hpp
     kernel/susan.hpp
