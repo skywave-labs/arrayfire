@@ -11,10 +11,7 @@
 #include <common/err_common.hpp>
 #include <copy.hpp>
 #include <kernel/sort_by_key.hpp>
-#include <platform.hpp>
 #include <queue.hpp>
-#include <range.hpp>
-#include <reorder.hpp>
 #include <sort_by_key.hpp>
 
 namespace arrayfire {
@@ -28,9 +25,6 @@ void sort_by_key(Array<Tk> &okey, Array<Tv> &oval, const Array<Tk> &ikey,
 
     switch (dim) {
         case 0:
-            getQueue().enqueue(kernel::sort0ByKey<Tk, Tv>, okey, oval,
-                               isAscending);
-            break;
         case 1:
         case 2:
         case 3:
@@ -38,23 +32,6 @@ void sort_by_key(Array<Tk> &okey, Array<Tv> &oval, const Array<Tk> &ikey,
                                dim, isAscending);
             break;
         default: AF_ERROR("Not Supported", AF_ERR_NOT_SUPPORTED);
-    }
-
-    if (dim != 0) {
-        af::dim4 preorderDims = okey.dims();
-        af::dim4 reorderDims(0, 1, 2, 3);
-        reorderDims[dim] = 0;
-        preorderDims[0]  = okey.dims()[dim];
-        for (int i = 1; i <= static_cast<int>(dim); i++) {
-            reorderDims[i - 1] = i;
-            preorderDims[i]    = okey.dims()[i - 1];
-        }
-
-        okey.setDataDims(preorderDims);
-        oval.setDataDims(preorderDims);
-
-        okey = reorder<Tk>(okey, reorderDims);
-        oval = reorder<Tv>(oval, reorderDims);
     }
 }
 

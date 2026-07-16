@@ -9,39 +9,85 @@
 
 #pragma once
 #include <Param.hpp>
-#include <err_cpu.hpp>
-#include <math.hpp>
+#include <kernel/sort_utils.hpp>
+#include <parallel.hpp>
+
 #include <algorithm>
+#include <cstddef>
 #include <functional>
-#include <numeric>
+#include <iterator>
+#include <vector>
 
 namespace arrayfire {
 namespace cpu {
 namespace kernel {
 
-// Based off of http://stackoverflow.com/a/12399290
-template<typename T>
-void sort0Iterative(Param<T> val, bool isAscending) {
-    // initialize original index locations
-    T *val_ptr = val.get();
+namespace detail {
 
-    std::function<bool(T, T)> op = std::greater<T>();
-    if (isAscending) { op = std::less<T>(); }
-
-    T *comp_ptr = nullptr;
-    for (dim_t w = 0; w < val.dims(3); w++) {
-        dim_t valW = w * val.strides(3);
-        for (dim_t z = 0; z < val.dims(2); z++) {
-            dim_t valWZ = valW + z * val.strides(2);
-            for (dim_t y = 0; y < val.dims(1); y++) {
-                dim_t valOffset = valWZ + y * val.strides(1);
-
-                comp_ptr = val_ptr + valOffset;
-                std::sort(comp_ptr, comp_ptr + val.dims(0), op);
-            }
+template<typename Iterator>
+void sortRange(Iterator begin, Iterator end, const bool isAscending,
+               const bool isStable) {
+    using Value = typename std::iterator_traits<Iterator>::value_type;
+    if (isAscending) {
+        if (isStable) {
+            std::stable_sort(begin, end, std::less<Value>());
+        } else {
+            std::sort(begin, end, std::less<Value>());
+        }
+    } else {
+        if (isStable) {
+            std::stable_sort(begin, end, std::greater<Value>());
+        } else {
+            std::sort(begin, end, std::greater<Value>());
         }
     }
-    return;
+}
+
+}  // namespace detail
+
+template<typename T>
+void sortDim(Param<T> val, const unsigned dim, const bool isAscending) {
+    const af::dim4 dims       = val.dims();
+    const dim_t line_length   = dims[dim];
+    const size_t line_count   = detail::sortLineCount(dims, dim);
+    if (line_length <= 1 || line_count == 0) { return; }
+
+    T *const values             = val.get();
+    const af::dim4 strides      = val.strides();
+    const dim_t element_stride  = strides[dim];
+    const size_t length         = static_cast<size_t>(line_length);
+    const size_t min_lines      = detail::sortMinLinesPerTask(line_length);
+    // Preserve the legacy value-sort policy: small dim-0 batches used
+    // std::sort, while every former global-batched path was stable.
+    const bool preserve_stable_order = dim != 0 || line_count > 10;
+
+    parallelForRange(
+        line_count, min_lines, [=](const size_t begin, const size_t end) {
+            std::vector<T> scratch(element_stride == 1 ? 0 : length);
+            detail::SortLineIndexer line_indexer(begin, dims, strides, dim);
+
+            for (size_t line = begin; line < end; ++line) {
+                T *const line_values = values + line_indexer.offset();
+
+                if (element_stride == 1) {
+                    detail::sortRange(line_values, line_values + line_length,
+                                      isAscending, preserve_stable_order);
+                } else {
+                    for (size_t element = 0; element < length; ++element) {
+                        scratch[element] =
+                            line_values[static_cast<dim_t>(element) *
+                                        element_stride];
+                    }
+                    detail::sortRange(scratch.begin(), scratch.end(),
+                                      isAscending, preserve_stable_order);
+                    for (size_t element = 0; element < length; ++element) {
+                        line_values[static_cast<dim_t>(element) *
+                                    element_stride] = scratch[element];
+                    }
+                }
+                line_indexer.next();
+            }
+        });
 }
 
 }  // namespace kernel
