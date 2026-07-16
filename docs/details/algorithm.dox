@@ -20,6 +20,8 @@ Floating-point addition is not associative. Reduction order is implementation
 dependent and may vary across backends, architectures, thread configurations,
 and ArrayFire versions. Floating-point and complex results are therefore not
 guaranteed to be bitwise reproducible across those configurations.
+The CPU backend provides an optional reassociated whole-array mode, enabled
+explicitly or by fast-math builds; see \ref af_cpu_reduce_all_reassociate.
 
 This table defines output types for corresponding input types:
 
@@ -80,6 +82,8 @@ implementation dependent and may vary across backends, architectures, thread
 configurations, and ArrayFire versions. Floating-point and complex results are
 therefore not guaranteed to be bitwise reproducible across those
 configurations.
+The CPU backend provides an optional reassociated whole-array mode, enabled
+explicitly or by fast-math builds; see \ref af_cpu_reduce_all_reassociate.
 
 This table defines output types for corresponding input types:
 

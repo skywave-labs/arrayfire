@@ -247,6 +247,29 @@ conservative 262,144-point threading gate. The configured limit is always
 respected. Other native FFTW builds remain single-threaded for FFTs, while MKL
 builds use MKL's runtime threading controls.
 
+AF_CPU_REDUCE_ALL_REASSOCIATE {#af_cpu_reduce_all_reassociate}
+-------------------------------------------------------------------------------
+
+When set to `1`, this environment variable allows the CPU backend to
+reassociate sufficiently large whole-array floating-point and complex `sum`
+and `product` reductions. Eligible inputs contain at least 131,072 elements of
+type f16, f32, f64, c32, or c64. The reduction uses fixed logical blocks and
+merges them in order, so its result is independent of worker scheduling and
+the value of `AF_CPU_NUM_THREADS`.
+
+Reassociation trades bitwise reproducibility for parallel performance. It can
+change rounding, cancellation and overflow behavior, signed zero, NaN payloads,
+and complex infinity/NaN recovery. The setting is process-wide and also applies
+to library operations that internally use a whole-array floating-point sum.
+Dimensional reductions, integral inputs, and min/max/truth/count reductions are
+not affected.
+
+The value is read and cached on the first eligible CPU whole-array sum or
+product. It must be set before that operation; changing it later has no effect.
+The default is disabled. Builds configured with `AF_WITH_FAST_MATH=ON` enable
+it by default. Any explicit nonempty value other than `1` disables this blocked
+path; an empty value is treated as unset.
+
 AF_BUILD_LIB_CUSTOM_PATH {#af_build_lib_custom_path}
 -------------------------------------------------------------------------------
 

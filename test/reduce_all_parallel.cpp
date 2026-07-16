@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -31,6 +32,16 @@ namespace {
 
 constexpr size_t blockElements = 1 << 16;
 
+int disableReassociatedReduceAll() {
+#if defined(_WIN32)
+    return _putenv_s("AF_CPU_REDUCE_ALL_REASSOCIATE", "0");
+#else
+    return setenv("AF_CPU_REDUCE_ALL_REASSOCIATE", "0", 1);
+#endif
+}
+
+const int reassociationEnvironmentResult = disableReassociatedReduceAll();
+
 size_t linearIndex(const dim4 &dims, const dim_t x, const dim_t y,
                    const dim_t z, const dim_t w) {
     return static_cast<size_t>(
@@ -43,6 +54,43 @@ void expectComplexEqual(const cfloat expected, const cfloat actual) {
 }
 
 }  // namespace
+
+TEST(ReduceAllParallel, DefaultFloatingArithmeticPreservesLeftFold) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    ASSERT_EQ(0, reassociationEnvironmentResult);
+
+    const size_t elements = 2 * blockElements;
+    const float large = std::ldexp(1.0F, std::numeric_limits<float>::digits);
+
+    vector<float> sumValues(elements, 0.0F);
+    sumValues[blockElements - 1] = large;
+    sumValues[blockElements]     = -large;
+    sumValues[blockElements + 1] = 1.0F;
+    float expectedSum            = 0.0F;
+    for (const float value : sumValues) { expectedSum = value + expectedSum; }
+
+    const array sumInput(static_cast<dim_t>(elements), sumValues.data());
+    const float scalarSum = af::sum<float>(sumInput);
+    const float arraySum  = af::sum<array>(sumInput).scalar<float>();
+    EXPECT_EQ(0, std::memcmp(&expectedSum, &scalarSum, sizeof(float)));
+    EXPECT_EQ(0, std::memcmp(&expectedSum, &arraySum, sizeof(float)));
+
+    vector<float> productValues(elements, 1.0F);
+    productValues[blockElements - 1] = std::numeric_limits<float>::max();
+    productValues[blockElements]     = 2.0F;
+    productValues[blockElements + 1] = 0.5F;
+    float expectedProduct            = 1.0F;
+    for (const float value : productValues) {
+        expectedProduct = value * expectedProduct;
+    }
+
+    const array productInput(static_cast<dim_t>(elements),
+                             productValues.data());
+    const float scalarProduct = af::product<float>(productInput);
+    const float arrayProduct = af::product<array>(productInput).scalar<float>();
+    EXPECT_EQ(0, std::memcmp(&expectedProduct, &scalarProduct, sizeof(float)));
+    EXPECT_EQ(0, std::memcmp(&expectedProduct, &arrayProduct, sizeof(float)));
+}
 
 TEST(ReduceAllParallel, TruthAndCountAtPartitionBoundaries) {
     const size_t sizes[] = {blockElements - 1, blockElements,
