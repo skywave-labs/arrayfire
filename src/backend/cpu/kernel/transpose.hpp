@@ -13,6 +13,7 @@
 #include <cpu_features.hpp>
 #include <err_cpu.hpp>
 #include <kernel/transpose_avx2.hpp>
+#include <kernel/transpose_neon.hpp>
 #include <parallel.hpp>
 #include <utility.hpp>
 
@@ -41,8 +42,19 @@ cdouble getConjugate(const cdouble &in) {
 
 namespace detail {
 
+static_assert(sizeof(cfloat) == 2 * sizeof(float));
+static_assert(sizeof(cdouble) == 2 * sizeof(double));
+
+#if defined(AF_CPU_COMPILE_NEON_TRANSPOSE) && defined(__aarch64__) && \
+    (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#define AF_CPU_NEON_TRANSPOSE_TARGET
+enum class TransposeKernel { SCALAR, NEON };
+#else
+using TransposeKernel = bool;
+#endif
+
 template<typename T>
-constexpr bool isAVX2TransposeType =
+constexpr bool isVectorizedTransposeType =
     (std::is_same<T, float>::value || std::is_same<T, double>::value ||
      std::is_same<T, int>::value || std::is_same<T, uint>::value ||
      std::is_same<T, intl>::value || std::is_same<T, uintl>::value ||
@@ -50,13 +62,27 @@ constexpr bool isAVX2TransposeType =
     (sizeof(T) == 4 || sizeof(T) == 8 || sizeof(T) == 16);
 
 template<typename T>
-bool canUseTransposeAVX2(dim_t output_x_stride, dim_t input_x_stride) {
-    if constexpr (isAVX2TransposeType<T>) {
-        return output_x_stride == 1 && input_x_stride == 1 &&
-               arrayfire::cpu::detail::isAVX2Supported() &&
-               isTransposeAVX2Compiled();
+TransposeKernel selectTransposeKernel(dim_t output_x_stride,
+                                      dim_t input_x_stride) {
+    if constexpr (isVectorizedTransposeType<T>) {
+        if (output_x_stride == 1 && input_x_stride == 1) {
+#if defined(AF_CPU_NEON_TRANSPOSE_TARGET)
+            if constexpr (sizeof(T) < 16) {
+                if (isTransposeNEONCompiled()) { return TransposeKernel::NEON; }
+            }
+#else
+            if (arrayfire::cpu::detail::isAVX2Supported() &&
+                isTransposeAVX2Compiled()) {
+                return true;
+            }
+#endif
+        }
     }
+#if defined(AF_CPU_NEON_TRANSPOSE_TARGET)
+    return TransposeKernel::SCALAR;
+#else
     return false;
+#endif
 }
 
 }  // namespace detail
@@ -86,9 +112,24 @@ template<typename T, bool conjugate>
 void transpose_tile_run(T *output, const T *input, dim_t output_x_stride,
                         dim_t output_y_stride, dim_t input_x_stride,
                         dim_t input_y_stride, size_t tile_count,
-                        bool use_avx2) {
-    if constexpr (detail::isAVX2TransposeType<T>) {
-        if (use_avx2) {
+                        detail::TransposeKernel transpose_kernel) {
+    if constexpr (detail::isVectorizedTransposeType<T>) {
+#if defined(AF_CPU_NEON_TRANSPOSE_TARGET)
+        // Amortize the out-of-line dispatcher and shuffle setup. Narrow runs
+        // stay on the inlined scalar tile until native measurements justify a
+        // lower architecture-specific threshold.
+        constexpr size_t min_neon_tiles = 4;
+        if (transpose_kernel == detail::TransposeKernel::NEON &&
+            tile_count >= min_neon_tiles) {
+            constexpr bool conjugate_values =
+                conjugate && common::is_complex<T>::value;
+            detail::transposeTileRunNEON(output, input, output_y_stride,
+                                         input_y_stride, tile_count, sizeof(T),
+                                         conjugate_values);
+            return;
+        }
+#else
+        if (transpose_kernel) {
             constexpr bool conjugate_values =
                 conjugate && common::is_complex<T>::value;
             detail::transposeTileRunAVX2(output, input, output_y_stride,
@@ -96,6 +137,7 @@ void transpose_tile_run(T *output, const T *input, dim_t output_x_stride,
                                          conjugate_values);
             return;
         }
+#endif
     }
 
     constexpr dim_t tile_size = 8;
@@ -142,8 +184,8 @@ void transpose_out(Param<T> output, CParam<T> input) {
     const size_t tile_count   = x_tiles * y_tiles * static_cast<size_t>(depth) *
                               static_cast<size_t>(batches);
 
-    const bool use_avx2 =
-        detail::canUseTransposeAVX2<T>(output_x_stride, input_x_stride);
+    const detail::TransposeKernel transpose_kernel =
+        detail::selectTransposeKernel<T>(output_x_stride, input_x_stride);
     const bool all_tiles_full =
         output_width % tile_size == 0 && output_height % tile_size == 0;
 
@@ -179,7 +221,7 @@ void transpose_out(Param<T> output, CParam<T> input) {
                     transpose_tile_run<T, conjugate>(
                         tile_output, tile_input, output_x_stride,
                         output_y_stride, input_x_stride, input_y_stride, run,
-                        use_avx2);
+                        transpose_kernel);
                     tile += run;
                     tile_x += run;
                     if (tile == end) { break; }
@@ -233,7 +275,7 @@ void transpose_out(Param<T> output, CParam<T> input) {
                     transpose_tile_run<T, conjugate>(
                         tile_output, tile_input, output_x_stride,
                         output_y_stride, input_x_stride, input_y_stride, run,
-                        use_avx2);
+                        transpose_kernel);
                 } else {
                     // Read contiguous input rows and scatter within a
                     // cache-sized tile. Reversing these loops makes every
@@ -303,8 +345,8 @@ void transpose_serial(Param<T> output, CParam<T> input) {
     const dim_t full_width    = output_width / tile_size * tile_size;
     const dim_t full_height   = output_height / tile_size * tile_size;
     const size_t full_x_tiles = static_cast<size_t>(full_width / tile_size);
-    const bool use_avx2 =
-        detail::canUseTransposeAVX2<T>(output_x_stride, input_x_stride);
+    const detail::TransposeKernel transpose_kernel =
+        detail::selectTransposeKernel<T>(output_x_stride, input_x_stride);
 
     for (dim_t w = 0; w < batches; ++w) {
         for (dim_t z = 0; z < depth; ++z) {
@@ -319,7 +361,7 @@ void transpose_serial(Param<T> output, CParam<T> input) {
                         output_batch + y * output_y_stride,
                         input_batch + y * input_x_stride, output_x_stride,
                         output_y_stride, input_x_stride, input_y_stride,
-                        full_x_tiles, use_avx2);
+                        full_x_tiles, transpose_kernel);
                 }
 
                 for (dim_t x = full_width; x < output_width; ++x) {
@@ -547,3 +589,5 @@ void transpose_inplace(Param<T> in, const bool conjugate) {
 }  // namespace kernel
 }  // namespace cpu
 }  // namespace arrayfire
+
+#undef AF_CPU_NEON_TRANSPOSE_TARGET
