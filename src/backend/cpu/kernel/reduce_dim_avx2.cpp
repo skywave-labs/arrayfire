@@ -428,8 +428,17 @@ struct ComplexVector<cfloat> {
     using Real                       = float;
     static constexpr size_t elements = 4;
 
+    template<ReductionOperation op>
     AF_CPU_AVX2_TARGET static Type initial() noexcept {
-        return _mm256_setzero_ps();
+        static_assert(op == ReductionOperation::Sum ||
+                          op == ReductionOperation::Product,
+                      "complex vectors only support arithmetic reductions");
+        if constexpr (op == ReductionOperation::Sum) {
+            return _mm256_setzero_ps();
+        } else {
+            return _mm256_setr_ps(1.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F,
+                                  1.0F, 0.0F);
+        }
     }
 
     AF_CPU_AVX2_TARGET static Type load(const cfloat *pointer) noexcept {
@@ -451,9 +460,25 @@ struct ComplexVector<cfloat> {
         return _mm256_blendv_ps(value, replacement_pairs, unordered);
     }
 
+    template<ReductionOperation op>
     AF_CPU_AVX2_TARGET static Type combine(Type input,
                                            Type accumulator) noexcept {
-        return _mm256_add_ps(input, accumulator);
+        static_assert(op == ReductionOperation::Sum ||
+                          op == ReductionOperation::Product,
+                      "complex vectors only support arithmetic reductions");
+        if constexpr (op == ReductionOperation::Sum) {
+            return _mm256_add_ps(input, accumulator);
+        } else {
+            // Keep input on the left and avoid FMA so finite lanes preserve
+            // the scalar fold's operation order exactly.
+            const Type input_real = _mm256_moveldup_ps(input);
+            const Type input_imag = _mm256_movehdup_ps(input);
+            const Type accumulator_swapped =
+                _mm256_permute_ps(accumulator, 0xB1);
+            return _mm256_addsub_ps(
+                _mm256_mul_ps(input_real, accumulator),
+                _mm256_mul_ps(input_imag, accumulator_swapped));
+        }
     }
 };
 
@@ -463,8 +488,16 @@ struct ComplexVector<cdouble> {
     using Real                       = double;
     static constexpr size_t elements = 2;
 
+    template<ReductionOperation op>
     AF_CPU_AVX2_TARGET static Type initial() noexcept {
-        return _mm256_setzero_pd();
+        static_assert(op == ReductionOperation::Sum ||
+                          op == ReductionOperation::Product,
+                      "complex vectors only support arithmetic reductions");
+        if constexpr (op == ReductionOperation::Sum) {
+            return _mm256_setzero_pd();
+        } else {
+            return _mm256_setr_pd(1.0, 0.0, 1.0, 0.0);
+        }
     }
 
     AF_CPU_AVX2_TARGET static Type load(const cdouble *pointer) noexcept {
@@ -485,9 +518,25 @@ struct ComplexVector<cdouble> {
         return _mm256_blendv_pd(value, replacement_pairs, unordered);
     }
 
+    template<ReductionOperation op>
     AF_CPU_AVX2_TARGET static Type combine(Type input,
                                            Type accumulator) noexcept {
-        return _mm256_add_pd(input, accumulator);
+        static_assert(op == ReductionOperation::Sum ||
+                          op == ReductionOperation::Product,
+                      "complex vectors only support arithmetic reductions");
+        if constexpr (op == ReductionOperation::Sum) {
+            return _mm256_add_pd(input, accumulator);
+        } else {
+            // Keep input on the left and avoid FMA so finite lanes preserve
+            // the scalar fold's operation order exactly.
+            const Type input_real = _mm256_permute_pd(input, 0x0);
+            const Type input_imag = _mm256_permute_pd(input, 0xF);
+            const Type accumulator_swapped =
+                _mm256_permute_pd(accumulator, 0x5);
+            return _mm256_addsub_pd(
+                _mm256_mul_pd(input_real, accumulator),
+                _mm256_mul_pd(input_imag, accumulator_swapped));
+        }
     }
 };
 
@@ -616,7 +665,7 @@ AF_CPU_AVX2_TARGET void reduceIntegerVectors(
     }
 }
 
-template<typename T, size_t vector_count>
+template<typename T, ReductionOperation op, size_t vector_count>
 AF_CPU_AVX2_TARGET void reduceComplexVectors(
     T *output, const T *input, const dim_t reduction_stride,
     const dim_t reduction_elements, const bool change_nan,
@@ -624,7 +673,7 @@ AF_CPU_AVX2_TARGET void reduceComplexVectors(
     using Vector = ComplexVector<T>;
     typename Vector::Type accumulators[vector_count];
     for (size_t vector = 0; vector < vector_count; ++vector) {
-        accumulators[vector] = Vector::initial();
+        accumulators[vector] = Vector::template initial<op>();
     }
 
     for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
@@ -633,7 +682,8 @@ AF_CPU_AVX2_TARGET void reduceComplexVectors(
             typename Vector::Type value =
                 Vector::load(row + vector * Vector::elements);
             if (change_nan) { value = Vector::replaceNaN(value, nanval); }
-            accumulators[vector] = Vector::combine(value, accumulators[vector]);
+            accumulators[vector] =
+                Vector::template combine<op>(value, accumulators[vector]);
         }
     }
 
@@ -767,11 +817,19 @@ To reduceIntegerScalar(const Ti *input, const dim_t reduction_stride,
     }
 }
 
-template<typename T>
+template<typename T, ReductionOperation op>
 T reduceComplexScalar(const T *input, const dim_t reduction_stride,
                       const dim_t reduction_elements, const bool change_nan,
                       const typename ComplexVector<T>::Real nanval) noexcept {
     using Real = typename ComplexVector<T>::Real;
+    static_assert(op == ReductionOperation::Sum ||
+                      op == ReductionOperation::Product,
+                  "complex scalar only supports arithmetic reductions");
+    if constexpr (op == ReductionOperation::Product) {
+        return reduceDimComplexProductScalar(input, reduction_stride,
+                                             reduction_elements, change_nan,
+                                             nanval);
+    }
     T accumulator(Real(0), Real(0));
     for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
         T value = input[reduced * reduction_stride];
@@ -988,7 +1046,7 @@ AF_CPU_AVX2_TARGET inline void reduceIntegerTile(
     }
 }
 
-template<typename T>
+template<typename T, ReductionOperation op>
 AF_CPU_AVX2_TARGET inline void reduceComplexTile(
     T *const output_base, const T *const input_base,
     const ReductionMetadata<T, T> &metadata, const int dim,
@@ -1007,22 +1065,22 @@ AF_CPU_AVX2_TARGET inline void reduceComplexTile(
         const size_t vector_count = tile.elements / Vector::elements;
         switch (vector_count) {
             case 4:
-                reduceComplexVectors<T, 4>(
+                reduceComplexVectors<T, op, 4>(
                     output, input, metadata.input_strides[dim],
                     metadata.reduction_elements, change_nan, replacement);
                 break;
             case 3:
-                reduceComplexVectors<T, 3>(
+                reduceComplexVectors<T, op, 3>(
                     output, input, metadata.input_strides[dim],
                     metadata.reduction_elements, change_nan, replacement);
                 break;
             case 2:
-                reduceComplexVectors<T, 2>(
+                reduceComplexVectors<T, op, 2>(
                     output, input, metadata.input_strides[dim],
                     metadata.reduction_elements, change_nan, replacement);
                 break;
             case 1:
-                reduceComplexVectors<T, 1>(
+                reduceComplexVectors<T, op, 1>(
                     output, input, metadata.input_strides[dim],
                     metadata.reduction_elements, change_nan, replacement);
                 break;
@@ -1032,10 +1090,11 @@ AF_CPU_AVX2_TARGET inline void reduceComplexTile(
     }
 
     for (size_t element = vector_elements; element < tile.elements; ++element) {
-        output[element * metadata.output_strides[0]] = reduceComplexScalar(
-            input + element * metadata.input_strides[0],
-            metadata.input_strides[dim], metadata.reduction_elements,
-            change_nan, replacement);
+        output[element * metadata.output_strides[0]] =
+            reduceComplexScalar<T, op>(
+                input + element * metadata.input_strides[0],
+                metadata.input_strides[dim], metadata.reduction_elements,
+                change_nan, replacement);
     }
 }
 
@@ -1113,7 +1172,7 @@ AF_CPU_AVX2_TARGET void reduceIntegerRange(Param<To> out, CParam<Ti> in,
     }
 }
 
-template<typename T>
+template<typename T, ReductionOperation op>
 AF_CPU_AVX2_TARGET void reduceComplexRange(Param<T> out, CParam<T> in,
                                            const int dim, const bool change_nan,
                                            const double nanval,
@@ -1128,8 +1187,8 @@ AF_CPU_AVX2_TARGET void reduceComplexRange(Param<T> out, CParam<T> in,
     for (size_t tile_index = tile_begin; tile_index < tile_end; ++tile_index) {
         TileDescriptor tile;
         if (!describeTile(tile, metadata, tile_index)) { break; }
-        reduceComplexTile(output, input, metadata, dim, tile, change_nan,
-                          nanval);
+        reduceComplexTile<T, op>(output, input, metadata, dim, tile,
+                                 change_nan, nanval);
     }
 }
 
@@ -1163,7 +1222,8 @@ AF_CPU_AVX2_TARGET void reduceDimSumRangeAVX2(Param<cfloat> out,
                                               const double nanval,
                                               const size_t tile_begin,
                                               const size_t tile_end) noexcept {
-    reduceComplexRange(out, in, dim, change_nan, nanval, tile_begin, tile_end);
+    reduceComplexRange<cfloat, ReductionOperation::Sum>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
 }
 
 AF_CPU_AVX2_TARGET void reduceDimSumRangeAVX2(Param<cdouble> out,
@@ -1172,7 +1232,8 @@ AF_CPU_AVX2_TARGET void reduceDimSumRangeAVX2(Param<cdouble> out,
                                               const double nanval,
                                               const size_t tile_begin,
                                               const size_t tile_end) noexcept {
-    reduceComplexRange(out, in, dim, change_nan, nanval, tile_begin, tile_end);
+    reduceComplexRange<cdouble, ReductionOperation::Sum>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
 }
 
 AF_CPU_AVX2_F16C_TARGET void reduceDimSumRangeAVX2(
@@ -1196,6 +1257,22 @@ AF_CPU_AVX2_TARGET void reduceDimProductRangeAVX2(
     const double nanval, const size_t tile_begin,
     const size_t tile_end) noexcept {
     reduceRealRange<double, ReductionOperation::Product>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
+}
+
+AF_CPU_AVX2_TARGET void reduceDimProductRangeAVX2(
+    Param<cfloat> out, CParam<cfloat> in, const int dim, const bool change_nan,
+    const double nanval, const size_t tile_begin,
+    const size_t tile_end) noexcept {
+    reduceComplexRange<cfloat, ReductionOperation::Product>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
+}
+
+AF_CPU_AVX2_TARGET void reduceDimProductRangeAVX2(
+    Param<cdouble> out, CParam<cdouble> in, const int dim,
+    const bool change_nan, const double nanval, const size_t tile_begin,
+    const size_t tile_end) noexcept {
+    reduceComplexRange<cdouble, ReductionOperation::Product>(
         out, in, dim, change_nan, nanval, tile_begin, tile_end);
 }
 
@@ -1309,6 +1386,12 @@ void reduceDimProductRangeAVX2(Param<float>, CParam<float>, int, bool, double,
 
 void reduceDimProductRangeAVX2(Param<double>, CParam<double>, int, bool, double,
                                size_t, size_t) noexcept {}
+
+void reduceDimProductRangeAVX2(Param<cfloat>, CParam<cfloat>, int, bool, double,
+                               size_t, size_t) noexcept {}
+
+void reduceDimProductRangeAVX2(Param<cdouble>, CParam<cdouble>, int, bool,
+                               double, size_t, size_t) noexcept {}
 
 void reduceDimProductRangeAVX2(Param<float>, CParam<common::half>, int, bool,
                                double, size_t, size_t) noexcept {}

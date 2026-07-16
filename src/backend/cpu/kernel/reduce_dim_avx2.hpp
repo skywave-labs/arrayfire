@@ -23,6 +23,17 @@ namespace detail {
 /// compiled into afcpu.
 bool isReduceDimAVX2Compiled() noexcept;
 
+// Baseline-ISA scalar folds used for complex SIMD tails and for exact recovery
+// when the ordinary four-operation formula encounters Inf/NaN values.
+cfloat reduceDimComplexProductScalar(const cfloat *input,
+                                     dim_t reduction_stride,
+                                     dim_t reduction_elements,
+                                     bool change_nan, float nanval) noexcept;
+cdouble reduceDimComplexProductScalar(const cdouble *input,
+                                      dim_t reduction_stride,
+                                      dim_t reduction_elements,
+                                      bool change_nan, double nanval) noexcept;
+
 // These functions may only be called after isAVX2Supported() returns true.
 // Overloads accepting half input additionally require isF16CSupported().
 // A tile contains 128 output bytes along dimension zero. Tile indices advance
@@ -47,6 +58,12 @@ void reduceDimProductRangeAVX2(Param<float> out, CParam<float> in, int dim,
                                bool change_nan, double nanval,
                                size_t tile_begin, size_t tile_end) noexcept;
 void reduceDimProductRangeAVX2(Param<double> out, CParam<double> in, int dim,
+                               bool change_nan, double nanval,
+                               size_t tile_begin, size_t tile_end) noexcept;
+void reduceDimProductRangeAVX2(Param<cfloat> out, CParam<cfloat> in, int dim,
+                               bool change_nan, double nanval,
+                               size_t tile_begin, size_t tile_end) noexcept;
+void reduceDimProductRangeAVX2(Param<cdouble> out, CParam<cdouble> in, int dim,
                                bool change_nan, double nanval,
                                size_t tile_begin, size_t tile_end) noexcept;
 void reduceDimProductRangeAVX2(Param<float> out, CParam<common::half> in,

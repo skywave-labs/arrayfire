@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -311,6 +312,52 @@ T productPattern(const size_t line, const dim_t reducedIndex) {
 }
 
 template<typename T>
+T finiteComplexProductPattern(const size_t line,
+                              const dim_t reducedIndex) {
+    // Each cycle stays close to unit magnitude while exercising both terms of
+    // the real and imaginary component formulas. The dyadic pairs also expose
+    // operation-order or accidental-FMA differences without overflowing a
+    // 257-element scalar fold.
+    const T pattern[] = {T(1.0, 0.0625),   T(1.0, -0.0625),
+                         T(-1.0, 0.03125), T(-1.0, -0.03125),
+                         T(0.75, 0.25),    T(1.2, -0.4)};
+    return pattern[(5 * line + static_cast<size_t>(reducedIndex)) % 6];
+}
+
+template<>
+cfloat productPattern<cfloat>(const size_t line,
+                              const dim_t reducedIndex) {
+    return finiteComplexProductPattern<cfloat>(line, reducedIndex);
+}
+
+template<>
+cdouble productPattern<cdouble>(const size_t line,
+                                const dim_t reducedIndex) {
+    return finiteComplexProductPattern<cdouble>(line, reducedIndex);
+}
+
+template<typename T>
+T hostMultiply(const T lhs, const T rhs) {
+    return lhs * rhs;
+}
+
+template<>
+cfloat hostMultiply<cfloat>(const cfloat lhs, const cfloat rhs) {
+    const std::complex<float> left(lhs.real, lhs.imag);
+    const std::complex<float> right(rhs.real, rhs.imag);
+    const std::complex<float> result = left * right;
+    return cfloat(result.real(), result.imag());
+}
+
+template<>
+cdouble hostMultiply<cdouble>(const cdouble lhs, const cdouble rhs) {
+    const std::complex<double> left(lhs.real, lhs.imag);
+    const std::complex<double> right(rhs.real, rhs.imag);
+    const std::complex<double> result = left * right;
+    return cdouble(result.real(), result.imag());
+}
+
+template<typename T>
 void expectBitwiseEqual(const vector<T> &expected, const vector<T> &actual) {
     ASSERT_EQ(expected.size(), actual.size());
     ASSERT_EQ(0, std::memcmp(expected.data(), actual.data(),
@@ -353,8 +400,7 @@ void checkDimensionalSum(const dim_t width, const int dim) {
 }
 
 template<typename T>
-void checkDimensionalProduct(const dim_t width, const int dim) {
-    const dim4 dims = dimensionalReduceDims(width, dim);
+void checkDimensionalProduct(const dim4 &dims, const int dim) {
     dim4 outputDims = dims;
     outputDims[dim] = 1;
     vector<T> input(static_cast<size_t>(dims.elements()));
@@ -373,7 +419,7 @@ void checkDimensionalProduct(const dim_t width, const int dim) {
                         const T inputValue = productPattern<T>(outputIndex, r);
                         input[linearIndex(dims, coords[0], coords[1], coords[2],
                                           coords[3])] = inputValue;
-                        value                         = inputValue * value;
+                        value = hostMultiply(inputValue, value);
                     }
                     expected[outputIndex] = value;
                 }
@@ -385,6 +431,11 @@ void checkDimensionalProduct(const dim_t width, const int dim) {
     vector<T> actual(expected.size());
     output.host(actual.data());
     expectBitwiseEqual(expected, actual);
+}
+
+template<typename T>
+void checkDimensionalProduct(const dim_t width, const int dim) {
+    checkDimensionalProduct<T>(dimensionalReduceDims(width, dim), dim);
 }
 
 template<typename T>
@@ -517,6 +568,52 @@ void checkGappedDimensionalSum(const int dim) {
     const array output = af::sum(view, dim);
     vector<float> actual(expected.size());
     output.host(actual.data());
+    expectBitwiseEqual(expected, actual);
+}
+
+template<typename T>
+void checkGappedDimensionalComplexProduct(const dim_t width, const int dim) {
+    const dim4 dims = dimensionalReduceDims(width, dim);
+    dim4 parentDims = dims;
+    parentDims[dim] += 2;
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<T> input(static_cast<size_t>(parentDims.elements()), T(91, 37));
+    vector<T> expected(static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        linearIndex(outputDims, x, y, z, w);
+                    T value(1, 0);
+                    for (dim_t r = 0; r < dims[dim]; ++r) {
+                        coords[dim]        = r + 1;
+                        const T inputValue = productPattern<T>(outputIndex, r);
+                        input[linearIndex(parentDims, coords[0], coords[1],
+                                          coords[2], coords[3])] = inputValue;
+                        value = hostMultiply(inputValue, value);
+                    }
+                    expected[outputIndex] = value;
+                }
+            }
+        }
+    }
+
+    const array parent(parentDims, input.data());
+    array view;
+    if (dim == 1) {
+        view = parent(span, seq(1, dimensionalReduceLength), span, span);
+    } else if (dim == 2) {
+        view = parent(span, span, seq(1, dimensionalReduceLength), span);
+    } else {
+        view = parent(span, span, span, seq(1, dimensionalReduceLength));
+    }
+
+    vector<T> actual(expected.size());
+    af::product(view, dim).host(actual.data());
     expectBitwiseEqual(expected, actual);
 }
 
@@ -749,7 +846,7 @@ void checkDimensionalProductNanval(const dim_t width, const int dim) {
                         const T foldValue             = hostIsNan(inputValue)
                                                             ? nanReplacement<T>(nanval)
                                                             : inputValue;
-                        value                         = foldValue * value;
+                        value = hostMultiply(foldValue, value);
                     }
                     expected[outputIndex] = value;
                 }
@@ -767,6 +864,126 @@ void checkDimensionalProductNanval(const dim_t width, const int dim) {
     vector<T> actual(expected.size());
     output.host(actual.data());
     expectBitwiseEqual(expected, actual);
+}
+
+template<typename T>
+struct ComplexRealType;
+
+template<>
+struct ComplexRealType<cfloat> {
+    using type = float;
+};
+
+template<>
+struct ComplexRealType<cdouble> {
+    using type = double;
+};
+
+template<typename T>
+T exceptionalComplexProductPattern(const size_t line,
+                                   const dim_t reducedIndex,
+                                   const dim_t reductionLength) {
+    using R = typename ComplexRealType<T>::type;
+    const R inf = std::numeric_limits<R>::infinity();
+    const R nan = std::numeric_limits<R>::quiet_NaN();
+    const R max = std::numeric_limits<R>::max();
+
+    switch (line % 10) {
+        case 0:
+            if (reducedIndex == 0) { return T(inf, R(0)); }
+            if (reducedIndex == 1) { return T(R(0), R(1)); }
+            break;
+        case 1:
+            if (reducedIndex == 0) { return T(-inf, R(0)); }
+            if (reducedIndex == 1) { return T(R(0), R(1)); }
+            break;
+        case 2:
+            if (reducedIndex == 0) { return T(R(0), inf); }
+            if (reducedIndex == 1) { return T(R(1), R(1)); }
+            break;
+        case 3:
+            if (reducedIndex == 0) { return T(inf, inf); }
+            break;
+        case 4:
+            if (reducedIndex == 0) { return T(inf, nan); }
+            break;
+        case 5:
+            if (reducedIndex == 0) { return T(nan, R(2)); }
+            break;
+        case 6:
+            if (reducedIndex == 0) { return T(max, max); }
+            if (reducedIndex == 1) { return T(R(2), R(2)); }
+            break;
+        case 7:
+            if (reducedIndex == reductionLength - 1) {
+                return T(-R(0), R(0));
+            }
+            break;
+        case 8:
+            if (reducedIndex == reductionLength - 1) {
+                return T(-R(0), -R(0));
+            }
+            break;
+        default:
+            if (reducedIndex == 0) { return T(-R(0), R(0)); }
+            if (reducedIndex == 1) { return T(R(0), R(1)); }
+            break;
+    }
+    return T(R(1), R(0));
+}
+
+template<typename R>
+void expectComplexPartEquivalent(const R expected, const R actual) {
+    if (std::isnan(expected)) {
+        EXPECT_TRUE(std::isnan(actual));
+    } else {
+        EXPECT_EQ(0, std::memcmp(&expected, &actual, sizeof(R)));
+    }
+}
+
+template<typename T>
+void expectComplexEquivalent(const T expected, const T actual) {
+    expectComplexPartEquivalent(expected.real, actual.real);
+    expectComplexPartEquivalent(expected.imag, actual.imag);
+}
+
+template<typename T>
+void checkDimensionalComplexProductExceptional(const dim_t width,
+                                               const int dim) {
+    const dim4 dims = dimensionalReduceDims(width, dim);
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<T> input(static_cast<size_t>(dims.elements()));
+    vector<T> expected(static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        linearIndex(outputDims, x, y, z, w);
+                    T value(1, 0);
+                    for (dim_t r = 0; r < dims[dim]; ++r) {
+                        coords[dim] = r;
+                        const T inputValue = exceptionalComplexProductPattern<T>(
+                            outputIndex, r, dims[dim]);
+                        input[linearIndex(dims, coords[0], coords[1],
+                                          coords[2], coords[3])] = inputValue;
+                        value = hostMultiply(inputValue, value);
+                    }
+                    expected[outputIndex] = value;
+                }
+            }
+        }
+    }
+
+    vector<T> actual(expected.size());
+    af::product(array(dims, input.data()), dim).host(actual.data());
+    for (size_t line = 0; line < expected.size(); ++line) {
+        SCOPED_TRACE(::testing::Message() << "output line " << line);
+        expectComplexEquivalent(expected[line], actual[line]);
+    }
 }
 
 template<typename T>
@@ -1111,6 +1328,44 @@ TEST(ReduceDimExactCpu, ProductF64PreservesScalarFold) {
     checkProductWidths<double>(widths, sizeof(widths) / sizeof(widths[0]));
 }
 
+TEST(ReduceDimExactCpu, ProductC32PreservesScalarFold) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    // c32 has four complex values per vector and sixteen per 128-byte tile.
+    // Width 23 includes one tile, another vector, and three scalar values.
+    const dim_t widths[] = {3, 4, 5, 15, 16, 23};
+    checkProductWidths<cfloat>(widths, sizeof(widths) / sizeof(widths[0]));
+}
+
+TEST(ReduceDimExactCpu, ProductC64PreservesScalarFold) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    // c64 has two complex values per vector and eight per 128-byte tile.
+    // Width 11 includes one tile, another vector, and one scalar value.
+    const dim_t widths[] = {1, 2, 3, 7, 8, 11};
+    checkProductWidths<cdouble>(widths, sizeof(widths) / sizeof(widths[0]));
+}
+
+TEST(ReduceDimExactCpu, ComplexProductExceptionalValuesMatchScalarFold) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        checkDimensionalComplexProductExceptional<cfloat>(23, dim);
+        checkDimensionalComplexProductExceptional<cdouble>(11, dim);
+    }
+}
+
+TEST(ReduceDimExactCpu, ComplexProductFallbacksPreserveScalarFold) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    // Dimension zero is never handled by the dimensional SIMD path.
+    checkDimensionalProduct<cfloat>(dim4(257, 4, 3, 2), 0);
+    checkDimensionalProduct<cdouble>(dim4(257, 4, 3, 2), 0);
+
+    // These inputs have a full output vector but remain below the 4096-element
+    // SIMD threshold. Narrow-output fallbacks are also covered by widths 3 and
+    // 1 in the c32/c64 finite-fold tests above.
+    checkDimensionalProduct<cfloat>(dim4(4, 127, 2, 2), 1);
+    checkDimensionalProduct<cdouble>(dim4(2, 127, 2, 2), 1);
+}
+
 TEST(ReduceDimExactCpu, MinMaxF32PreserveScalarFold) {
     SKIP_IF_FAST_MATH_ENABLED();
     const dim_t widths[] = {7, 8, 9, 31, 32, 35};
@@ -1128,6 +1383,8 @@ TEST(ReduceDimExactCpu, GappedSubarraysPreserveScalarFold) {
     for (int dim = 1; dim <= 3; ++dim) {
         SCOPED_TRACE(::testing::Message() << "dimension " << dim);
         checkGappedDimensionalSum(dim);
+        checkGappedDimensionalComplexProduct<cfloat>(23, dim);
+        checkGappedDimensionalComplexProduct<cdouble>(11, dim);
         checkGappedDimensionalExtrema<float>(35, dim);
         checkGappedDimensionalExtrema<double>(19, dim);
     }
@@ -1143,6 +1400,8 @@ TEST(ReduceDimExactCpu, NanAndNanvalSemantics) {
         checkDimensionalSumNanval<cdouble>(11, dim);
         checkDimensionalProductNanval<float>(35, dim);
         checkDimensionalProductNanval<double>(19, dim);
+        checkDimensionalProductNanval<cfloat>(23, dim);
+        checkDimensionalProductNanval<cdouble>(11, dim);
     }
 }
 

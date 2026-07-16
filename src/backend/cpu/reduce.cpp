@@ -41,6 +41,54 @@ struct Binary<cdouble, af_add_t> {
 }  // namespace common
 namespace cpu {
 
+namespace kernel {
+namespace detail {
+
+#if defined(_MSC_VER)
+#define AF_CPU_COMPLEX_PRODUCT_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define AF_CPU_COMPLEX_PRODUCT_NOINLINE __attribute__((noinline))
+#else
+#define AF_CPU_COMPLEX_PRODUCT_NOINLINE
+#endif
+
+template<typename T>
+T reduceDimComplexProductScalarImpl(const T *input,
+                                    const dim_t reduction_stride,
+                                    const dim_t reduction_elements,
+                                    const bool change_nan,
+                                    const typename T::value_type nanval) noexcept {
+    using Real = typename T::value_type;
+    T accumulator(Real(1), Real(0));
+    for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
+        T value = input[reduced * reduction_stride];
+        if (change_nan && value != value) { value = T(nanval, Real(0)); }
+        accumulator = value * accumulator;
+    }
+    return accumulator;
+}
+
+AF_CPU_COMPLEX_PRODUCT_NOINLINE cfloat reduceDimComplexProductScalar(
+    const cfloat *input, const dim_t reduction_stride,
+    const dim_t reduction_elements, const bool change_nan,
+    const float nanval) noexcept {
+    return reduceDimComplexProductScalarImpl(
+        input, reduction_stride, reduction_elements, change_nan, nanval);
+}
+
+AF_CPU_COMPLEX_PRODUCT_NOINLINE cdouble reduceDimComplexProductScalar(
+    const cdouble *input, const dim_t reduction_stride,
+    const dim_t reduction_elements, const bool change_nan,
+    const double nanval) noexcept {
+    return reduceDimComplexProductScalarImpl(
+        input, reduction_stride, reduction_elements, change_nan, nanval);
+}
+
+#undef AF_CPU_COMPLEX_PRODUCT_NOINLINE
+
+}  // namespace detail
+}  // namespace kernel
+
 template<af_op_t op, typename Ti, typename To>
 Array<To> reduce(const Array<Ti> &in, const int dim, bool change_nan,
                  double nanval) {
