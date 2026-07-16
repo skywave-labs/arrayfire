@@ -57,23 +57,35 @@ constexpr bool isAVX2IntegralExtremaType =
     std::is_same<T, intl>::value || std::is_same<T, uintl>::value;
 
 template<typename Ti, typename To>
+constexpr bool isF16CHalfArithmeticPair =
+    std::is_same<Ti, common::half>::value && std::is_same<To, float>::value;
+
+template<typename Ti, typename To>
+constexpr bool isF16CHalfExtremaPair =
+    std::is_same<Ti, common::half>::value &&
+    std::is_same<To, common::half>::value;
+
+template<typename Ti, typename To>
 constexpr bool isAVX2SumPair =
     (std::is_same<Ti, To>::value &&
      (std::is_same<Ti, float>::value || std::is_same<Ti, double>::value ||
       std::is_same<Ti, cfloat>::value || std::is_same<Ti, cdouble>::value)) ||
+    isF16CHalfArithmeticPair<Ti, To> ||
     isAVX2IntegralArithmeticPair<Ti, To>;
 
 template<typename Ti, typename To>
 constexpr bool isAVX2ProductPair =
     (std::is_same<Ti, To>::value &&
      (std::is_same<Ti, float>::value || std::is_same<Ti, double>::value)) ||
+    isF16CHalfArithmeticPair<Ti, To> ||
     isAVX2IntegralArithmeticPair<Ti, To>;
 
 template<typename Ti, typename To>
 constexpr bool isAVX2ExtremaPair =
-    std::is_same<Ti, To>::value &&
-    (std::is_same<Ti, float>::value || std::is_same<Ti, double>::value ||
-     isAVX2IntegralExtremaType<Ti>);
+    (std::is_same<Ti, To>::value &&
+     (std::is_same<Ti, float>::value || std::is_same<Ti, double>::value ||
+      isAVX2IntegralExtremaType<Ti>)) ||
+    isF16CHalfExtremaPair<Ti, To>;
 
 template<af_op_t op, typename Ti, typename To>
 constexpr bool isAVX2ReduceSupported =
@@ -96,6 +108,8 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
     constexpr bool supported_integral =
         isAVX2IntegralArithmeticPair<Ti, To> ||
         (std::is_same<Ti, To>::value && isAVX2IntegralExtremaType<Ti>);
+    constexpr bool supported_half =
+        isF16CHalfArithmeticPair<Ti, To> || isF16CHalfExtremaPair<Ti, To>;
 
     if constexpr (!supported_sum && !supported_product && !supported_minimum &&
                   !supported_maximum) {
@@ -103,7 +117,8 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
     } else {
         constexpr size_t vector_bytes             = 32;
         constexpr size_t tile_bytes               = 128;
-        constexpr size_t vector_elements          = vector_bytes / sizeof(To);
+        constexpr size_t vector_elements =
+            supported_half ? 8 : vector_bytes / sizeof(To);
         constexpr size_t tile_elements            = tile_bytes / sizeof(To);
         constexpr size_t target_elements_per_task = 1U << 16U;
 
@@ -119,6 +134,8 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
         }
 
         if (!arrayfire::cpu::detail::isAVX2Supported() ||
+            (supported_half &&
+             !arrayfire::cpu::detail::isF16CSupported()) ||
             !isReduceDimAVX2Compiled()) {
             return false;
         }
@@ -142,11 +159,13 @@ AF_CPU_REDUCE_NOINLINE bool tryReduceDimAVX2(
         }
         const size_t tile_count = x_tiles * row_count;
 
+        const size_t task_tile_elements =
+            supported_half ? std::min(width, tile_elements) : tile_elements;
         const size_t work_per_tile =
             reduced_elements >
-                    std::numeric_limits<size_t>::max() / tile_elements
+                    std::numeric_limits<size_t>::max() / task_tile_elements
                 ? std::numeric_limits<size_t>::max()
-                : reduced_elements * tile_elements;
+                : reduced_elements * task_tile_elements;
         const size_t min_tiles_per_task =
             work_per_tile >= target_elements_per_task
                 ? 1

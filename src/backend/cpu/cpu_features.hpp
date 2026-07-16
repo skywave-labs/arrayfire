@@ -20,6 +20,13 @@ namespace detail {
 /// conservatively return false.
 bool isAVX2Supported() noexcept;
 
+/// Returns true when both the processor and operating system support F16C.
+///
+/// The result is detected once and cached for the lifetime of the process.
+/// Callers using 256-bit F16C instructions must also check
+/// isAVX2Supported().
+bool isF16CSupported() noexcept;
+
 }  // namespace detail
 }  // namespace cpu
 }  // namespace arrayfire

@@ -19,14 +19,17 @@
 #if defined(AF_CPU_HAS_AVX2_INTRINSICS) && \
     (defined(__GNUC__) || defined(__clang__))
 #define AF_CPU_AVX2_TARGET __attribute__((target("avx2")))
+#define AF_CPU_AVX2_F16C_TARGET __attribute__((target("avx2,f16c")))
 #else
 #define AF_CPU_AVX2_TARGET
+#define AF_CPU_AVX2_F16C_TARGET
 #endif
 
 #include <algorithm>
 #include <cassert>
 #include <complex>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -219,6 +222,32 @@ struct RealVector<double> {
                 _mm256_cmp_pd(input, accumulator, _CMP_LT_OQ);
             return _mm256_blendv_pd(input, accumulator, keep_accumulator);
         }
+    }
+};
+
+struct HalfVector {
+    using Half                       = common::half;
+    using Type                       = __m256;
+    static constexpr size_t elements = 8;
+
+    static_assert(sizeof(Half) == sizeof(std::uint16_t),
+                  "F16C reductions require 16-bit half storage");
+    static_assert(std::is_trivially_copyable<Half>::value,
+                  "F16C reductions require trivially copyable half storage");
+
+    AF_CPU_AVX2_F16C_TARGET static Type load(
+        const Half *pointer) noexcept {
+        __m128i packed;
+        std::memcpy(&packed, pointer, sizeof(packed));
+        return _mm256_cvtph_ps(packed);
+    }
+
+    AF_CPU_AVX2_F16C_TARGET static void store(Half *pointer,
+                                               Type value) noexcept {
+        const __m128i packed = _mm256_cvtps_ph(
+            value, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        std::memcpy(reinterpret_cast<unsigned char *>(pointer), &packed,
+                    sizeof(packed));
     }
 };
 
@@ -498,6 +527,70 @@ AF_CPU_AVX2_TARGET void reduceRealVectors(T *output, const T *input,
     }
 }
 
+template<ReductionOperation op, size_t vector_count>
+AF_CPU_AVX2_F16C_TARGET void reduceHalfArithmeticVectors(
+    float *output, const common::half *input, const dim_t reduction_stride,
+    const dim_t reduction_elements, const bool change_nan,
+    const float nanval) noexcept {
+    static_assert(op == ReductionOperation::Sum ||
+                      op == ReductionOperation::Product,
+                  "half-to-float vectors only support arithmetic reductions");
+    using Vector = RealVector<float>;
+    typename Vector::Type accumulators[vector_count];
+    for (size_t vector = 0; vector < vector_count; ++vector) {
+        accumulators[vector] = Vector::template initial<op>();
+    }
+
+    for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
+        const common::half *const row = input + reduced * reduction_stride;
+        for (size_t vector = 0; vector < vector_count; ++vector) {
+            typename Vector::Type value =
+                HalfVector::load(row + vector * HalfVector::elements);
+            if (change_nan) { value = Vector::replaceNaN(value, nanval); }
+            accumulators[vector] =
+                Vector::template combine<op>(value, accumulators[vector]);
+        }
+    }
+
+    for (size_t vector = 0; vector < vector_count; ++vector) {
+        Vector::store(output + vector * Vector::elements, accumulators[vector]);
+    }
+}
+
+template<ReductionOperation op, size_t vector_count>
+AF_CPU_AVX2_F16C_TARGET void reduceHalfExtremaVectors(
+    common::half *output, const common::half *input,
+    const dim_t reduction_stride, const dim_t reduction_elements) noexcept {
+    static_assert(op == ReductionOperation::Minimum ||
+                      op == ReductionOperation::Maximum,
+                  "half vectors only support extrema reductions");
+    using Vector = RealVector<float>;
+    typename Vector::Type accumulators[vector_count];
+    for (size_t vector = 0; vector < vector_count; ++vector) {
+        accumulators[vector] = Vector::template initial<op>();
+    }
+
+    const float replacement =
+        op == ReductionOperation::Minimum
+            ? std::numeric_limits<float>::infinity()
+            : -std::numeric_limits<float>::infinity();
+    for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
+        const common::half *const row = input + reduced * reduction_stride;
+        for (size_t vector = 0; vector < vector_count; ++vector) {
+            typename Vector::Type value =
+                HalfVector::load(row + vector * HalfVector::elements);
+            value = Vector::replaceNaN(value, replacement);
+            accumulators[vector] =
+                Vector::template combine<op>(value, accumulators[vector]);
+        }
+    }
+
+    for (size_t vector = 0; vector < vector_count; ++vector) {
+        HalfVector::store(output + vector * HalfVector::elements,
+                          accumulators[vector]);
+    }
+}
+
 template<typename Ti, typename To, ReductionOperation op, size_t vector_count>
 AF_CPU_AVX2_TARGET void reduceIntegerVectors(
     To *output, const Ti *input, const dim_t reduction_stride,
@@ -582,6 +675,58 @@ T reduceRealScalar(const T *input, const dim_t reduction_stride,
         }
     }
     return accumulator;
+}
+
+template<ReductionOperation op>
+float reduceHalfArithmeticScalar(const common::half *input,
+                                 const dim_t reduction_stride,
+                                 const dim_t reduction_elements,
+                                 const bool change_nan,
+                                 const float nanval) noexcept {
+    static_assert(op == ReductionOperation::Sum ||
+                      op == ReductionOperation::Product,
+                  "half-to-float scalar only supports arithmetic reductions");
+    float accumulator =
+        op == ReductionOperation::Sum ? 0.0F : 1.0F;
+    for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
+        float value =
+            static_cast<float>(input[reduced * reduction_stride]);
+        if (change_nan && value != value) { value = nanval; }
+        if constexpr (op == ReductionOperation::Sum) {
+            accumulator = value + accumulator;
+        } else {
+            accumulator = value * accumulator;
+        }
+    }
+    return accumulator;
+}
+
+template<ReductionOperation op>
+common::half reduceHalfExtremaScalar(const common::half *input,
+                                     const dim_t reduction_stride,
+                                     const dim_t reduction_elements) noexcept {
+    static_assert(op == ReductionOperation::Minimum ||
+                      op == ReductionOperation::Maximum,
+                  "half scalar only supports extrema reductions");
+    float accumulator =
+        op == ReductionOperation::Minimum
+            ? std::numeric_limits<float>::infinity()
+            : -std::numeric_limits<float>::infinity();
+    for (dim_t reduced = 0; reduced < reduction_elements; ++reduced) {
+        float value =
+            static_cast<float>(input[reduced * reduction_stride]);
+        if (value != value) {
+            value = op == ReductionOperation::Minimum
+                        ? std::numeric_limits<float>::infinity()
+                        : -std::numeric_limits<float>::infinity();
+        }
+        if constexpr (op == ReductionOperation::Minimum) {
+            accumulator = std::min(value, accumulator);
+        } else {
+            accumulator = std::max(value, accumulator);
+        }
+    }
+    return common::half(accumulator);
 }
 
 template<typename Ti, typename To, ReductionOperation op>
@@ -681,6 +826,119 @@ AF_CPU_AVX2_TARGET inline void reduceRealTile(
             input + element * metadata.input_strides[0],
             metadata.input_strides[dim], metadata.reduction_elements,
             change_nan, replacement);
+    }
+}
+
+template<ReductionOperation op>
+AF_CPU_AVX2_F16C_TARGET inline void reduceHalfArithmeticTile(
+    float *const output_base, const common::half *const input_base,
+    const ReductionMetadata<common::half, float> &metadata, const int dim,
+    const TileDescriptor &tile, const bool change_nan,
+    const double nanval) noexcept {
+    float *const output             = output_base + tile.output_offset;
+    const common::half *const input = input_base + tile.input_offset;
+    const float replacement         = static_cast<float>(nanval);
+    size_t vector_elements          = 0;
+
+    if (metadata.output_strides[0] == 1 && metadata.input_strides[0] == 1) {
+        const size_t vector_count = tile.elements / HalfVector::elements;
+        switch (vector_count) {
+            case 4:
+                reduceHalfArithmeticVectors<op, 4>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements, change_nan, replacement);
+                break;
+            case 3:
+                reduceHalfArithmeticVectors<op, 3>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements, change_nan, replacement);
+                break;
+            case 2:
+                reduceHalfArithmeticVectors<op, 2>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements, change_nan, replacement);
+                break;
+            case 1:
+                reduceHalfArithmeticVectors<op, 1>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements, change_nan, replacement);
+                break;
+            default: break;
+        }
+        vector_elements = vector_count * HalfVector::elements;
+    }
+
+    for (size_t element = vector_elements; element < tile.elements; ++element) {
+        output[element * metadata.output_strides[0]] =
+            reduceHalfArithmeticScalar<op>(
+                input + element * metadata.input_strides[0],
+                metadata.input_strides[dim], metadata.reduction_elements,
+                change_nan, replacement);
+    }
+}
+
+template<ReductionOperation op>
+AF_CPU_AVX2_F16C_TARGET inline void reduceHalfExtremaTile(
+    common::half *const output_base, const common::half *const input_base,
+    const ReductionMetadata<common::half, common::half> &metadata,
+    const int dim, const TileDescriptor &tile) noexcept {
+    common::half *const output       = output_base + tile.output_offset;
+    const common::half *const input = input_base + tile.input_offset;
+    size_t vector_elements          = 0;
+
+    if (metadata.output_strides[0] == 1 && metadata.input_strides[0] == 1) {
+        const size_t vector_count = tile.elements / HalfVector::elements;
+        switch (vector_count) {
+            case 8:
+                reduceHalfExtremaVectors<op, 8>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 7:
+                reduceHalfExtremaVectors<op, 7>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 6:
+                reduceHalfExtremaVectors<op, 6>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 5:
+                reduceHalfExtremaVectors<op, 5>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 4:
+                reduceHalfExtremaVectors<op, 4>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 3:
+                reduceHalfExtremaVectors<op, 3>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 2:
+                reduceHalfExtremaVectors<op, 2>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            case 1:
+                reduceHalfExtremaVectors<op, 1>(
+                    output, input, metadata.input_strides[dim],
+                    metadata.reduction_elements);
+                break;
+            default: break;
+        }
+        vector_elements = vector_count * HalfVector::elements;
+    }
+
+    for (size_t element = vector_elements; element < tile.elements; ++element) {
+        output[element * metadata.output_strides[0]] =
+            reduceHalfExtremaScalar<op>(
+                input + element * metadata.input_strides[0],
+                metadata.input_strides[dim], metadata.reduction_elements);
     }
 }
 
@@ -801,6 +1059,42 @@ AF_CPU_AVX2_TARGET void reduceRealRange(Param<T> out, CParam<T> in,
     }
 }
 
+template<ReductionOperation op>
+AF_CPU_AVX2_F16C_TARGET void reduceHalfArithmeticRange(
+    Param<float> out, CParam<common::half> in, const int dim,
+    const bool change_nan, const double nanval, const size_t tile_begin,
+    const size_t tile_end) noexcept {
+    ReductionMetadata<common::half, float> metadata;
+    const bool valid_metadata = makeReductionMetadata(metadata, out, in, dim);
+    assert(valid_metadata);
+    if (!valid_metadata) { return; }
+    float *const output             = out.get();
+    const common::half *const input = in.get();
+    for (size_t tile_index = tile_begin; tile_index < tile_end; ++tile_index) {
+        TileDescriptor tile;
+        if (!describeTile(tile, metadata, tile_index)) { break; }
+        reduceHalfArithmeticTile<op>(output, input, metadata, dim, tile,
+                                     change_nan, nanval);
+    }
+}
+
+template<ReductionOperation op>
+AF_CPU_AVX2_F16C_TARGET void reduceHalfExtremaRange(
+    Param<common::half> out, CParam<common::half> in, const int dim,
+    const size_t tile_begin, const size_t tile_end) noexcept {
+    ReductionMetadata<common::half, common::half> metadata;
+    const bool valid_metadata = makeReductionMetadata(metadata, out, in, dim);
+    assert(valid_metadata);
+    if (!valid_metadata) { return; }
+    common::half *const output       = out.get();
+    const common::half *const input = in.get();
+    for (size_t tile_index = tile_begin; tile_index < tile_end; ++tile_index) {
+        TileDescriptor tile;
+        if (!describeTile(tile, metadata, tile_index)) { break; }
+        reduceHalfExtremaTile<op>(output, input, metadata, dim, tile);
+    }
+}
+
 template<typename Ti, typename To, ReductionOperation op>
 AF_CPU_AVX2_TARGET void reduceIntegerRange(Param<To> out, CParam<Ti> in,
                                            const int dim,
@@ -881,6 +1175,14 @@ AF_CPU_AVX2_TARGET void reduceDimSumRangeAVX2(Param<cdouble> out,
     reduceComplexRange(out, in, dim, change_nan, nanval, tile_begin, tile_end);
 }
 
+AF_CPU_AVX2_F16C_TARGET void reduceDimSumRangeAVX2(
+    Param<float> out, CParam<common::half> in, const int dim,
+    const bool change_nan, const double nanval, const size_t tile_begin,
+    const size_t tile_end) noexcept {
+    reduceHalfArithmeticRange<ReductionOperation::Sum>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
+}
+
 AF_CPU_AVX2_TARGET void reduceDimProductRangeAVX2(
     Param<float> out, CParam<float> in, const int dim, const bool change_nan,
     const double nanval, const size_t tile_begin,
@@ -894,6 +1196,14 @@ AF_CPU_AVX2_TARGET void reduceDimProductRangeAVX2(
     const double nanval, const size_t tile_begin,
     const size_t tile_end) noexcept {
     reduceRealRange<double, ReductionOperation::Product>(
+        out, in, dim, change_nan, nanval, tile_begin, tile_end);
+}
+
+AF_CPU_AVX2_F16C_TARGET void reduceDimProductRangeAVX2(
+    Param<float> out, CParam<common::half> in, const int dim,
+    const bool change_nan, const double nanval, const size_t tile_begin,
+    const size_t tile_end) noexcept {
+    reduceHalfArithmeticRange<ReductionOperation::Product>(
         out, in, dim, change_nan, nanval, tile_begin, tile_end);
 }
 
@@ -913,6 +1223,13 @@ AF_CPU_AVX2_TARGET void reduceDimMinRangeAVX2(
         out, in, dim, change_nan, nanval, tile_begin, tile_end);
 }
 
+AF_CPU_AVX2_F16C_TARGET void reduceDimMinRangeAVX2(
+    Param<common::half> out, CParam<common::half> in, const int dim, const bool,
+    const double, const size_t tile_begin, const size_t tile_end) noexcept {
+    reduceHalfExtremaRange<ReductionOperation::Minimum>(out, in, dim,
+                                                         tile_begin, tile_end);
+}
+
 AF_CPU_AVX2_TARGET void reduceDimMaxRangeAVX2(
     Param<float> out, CParam<float> in, const int dim, const bool change_nan,
     const double nanval, const size_t tile_begin,
@@ -927,6 +1244,13 @@ AF_CPU_AVX2_TARGET void reduceDimMaxRangeAVX2(
     const size_t tile_end) noexcept {
     reduceRealRange<double, ReductionOperation::Maximum>(
         out, in, dim, change_nan, nanval, tile_begin, tile_end);
+}
+
+AF_CPU_AVX2_F16C_TARGET void reduceDimMaxRangeAVX2(
+    Param<common::half> out, CParam<common::half> in, const int dim, const bool,
+    const double, const size_t tile_begin, const size_t tile_end) noexcept {
+    reduceHalfExtremaRange<ReductionOperation::Maximum>(out, in, dim,
+                                                         tile_begin, tile_end);
 }
 
 template<typename Ti, typename To>
@@ -977,11 +1301,17 @@ void reduceDimSumRangeAVX2(Param<cfloat>, CParam<cfloat>, int, bool, double,
 void reduceDimSumRangeAVX2(Param<cdouble>, CParam<cdouble>, int, bool, double,
                            size_t, size_t) noexcept {}
 
+void reduceDimSumRangeAVX2(Param<float>, CParam<common::half>, int, bool,
+                           double, size_t, size_t) noexcept {}
+
 void reduceDimProductRangeAVX2(Param<float>, CParam<float>, int, bool, double,
                                size_t, size_t) noexcept {}
 
 void reduceDimProductRangeAVX2(Param<double>, CParam<double>, int, bool, double,
                                size_t, size_t) noexcept {}
+
+void reduceDimProductRangeAVX2(Param<float>, CParam<common::half>, int, bool,
+                               double, size_t, size_t) noexcept {}
 
 void reduceDimMinRangeAVX2(Param<float>, CParam<float>, int, bool, double,
                            size_t, size_t) noexcept {}
@@ -989,11 +1319,17 @@ void reduceDimMinRangeAVX2(Param<float>, CParam<float>, int, bool, double,
 void reduceDimMinRangeAVX2(Param<double>, CParam<double>, int, bool, double,
                            size_t, size_t) noexcept {}
 
+void reduceDimMinRangeAVX2(Param<common::half>, CParam<common::half>, int, bool,
+                           double, size_t, size_t) noexcept {}
+
 void reduceDimMaxRangeAVX2(Param<float>, CParam<float>, int, bool, double,
                            size_t, size_t) noexcept {}
 
 void reduceDimMaxRangeAVX2(Param<double>, CParam<double>, int, bool, double,
                            size_t, size_t) noexcept {}
+
+void reduceDimMaxRangeAVX2(Param<common::half>, CParam<common::half>, int, bool,
+                           double, size_t, size_t) noexcept {}
 
 template<typename Ti, typename To>
 void reduceDimIntegerSumRangeAVX2(Param<To>, CParam<Ti>, int, bool, double,
@@ -1053,4 +1389,5 @@ INSTANTIATE_INTEGER_EXTREMA(unsigned long long)
 }  // namespace arrayfire
 
 #undef AF_CPU_AVX2_TARGET
+#undef AF_CPU_AVX2_F16C_TARGET
 #undef AF_CPU_HAS_AVX2_INTRINSICS
