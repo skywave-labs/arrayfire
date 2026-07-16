@@ -10,6 +10,7 @@
 #pragma once
 
 #include <Param.hpp>
+#include <common/half.hpp>
 
 #include <cstddef>
 
@@ -23,6 +24,7 @@ namespace detail {
 bool isReduceDimAVX2Compiled() noexcept;
 
 // These functions may only be called after isAVX2Supported() returns true.
+// Overloads accepting half input additionally require isF16CSupported().
 // A tile contains 128 output bytes along dimension zero. Tile indices advance
 // through x tiles first, followed by output dimensions one through three.
 void reduceDimSumRangeAVX2(Param<float> out, CParam<float> in, int dim,
@@ -37,12 +39,18 @@ void reduceDimSumRangeAVX2(Param<cfloat> out, CParam<cfloat> in, int dim,
 void reduceDimSumRangeAVX2(Param<cdouble> out, CParam<cdouble> in, int dim,
                            bool change_nan, double nanval, size_t tile_begin,
                            size_t tile_end) noexcept;
+void reduceDimSumRangeAVX2(Param<float> out, CParam<common::half> in, int dim,
+                           bool change_nan, double nanval, size_t tile_begin,
+                           size_t tile_end) noexcept;
 
 void reduceDimProductRangeAVX2(Param<float> out, CParam<float> in, int dim,
                                bool change_nan, double nanval,
                                size_t tile_begin, size_t tile_end) noexcept;
 void reduceDimProductRangeAVX2(Param<double> out, CParam<double> in, int dim,
                                bool change_nan, double nanval,
+                               size_t tile_begin, size_t tile_end) noexcept;
+void reduceDimProductRangeAVX2(Param<float> out, CParam<common::half> in,
+                               int dim, bool change_nan, double nanval,
                                size_t tile_begin, size_t tile_end) noexcept;
 
 void reduceDimMinRangeAVX2(Param<float> out, CParam<float> in, int dim,
@@ -51,6 +59,9 @@ void reduceDimMinRangeAVX2(Param<float> out, CParam<float> in, int dim,
 void reduceDimMinRangeAVX2(Param<double> out, CParam<double> in, int dim,
                            bool change_nan, double nanval, size_t tile_begin,
                            size_t tile_end) noexcept;
+void reduceDimMinRangeAVX2(Param<common::half> out, CParam<common::half> in,
+                           int dim, bool change_nan, double nanval,
+                           size_t tile_begin, size_t tile_end) noexcept;
 
 void reduceDimMaxRangeAVX2(Param<float> out, CParam<float> in, int dim,
                            bool change_nan, double nanval, size_t tile_begin,
@@ -58,6 +69,9 @@ void reduceDimMaxRangeAVX2(Param<float> out, CParam<float> in, int dim,
 void reduceDimMaxRangeAVX2(Param<double> out, CParam<double> in, int dim,
                            bool change_nan, double nanval, size_t tile_begin,
                            size_t tile_end) noexcept;
+void reduceDimMaxRangeAVX2(Param<common::half> out, CParam<common::half> in,
+                           int dim, bool change_nan, double nanval,
+                           size_t tile_begin, size_t tile_end) noexcept;
 
 // Integral reductions use separate entry points because 8- and 16-bit sum
 // and product inputs are widened to 32-bit outputs by the public API.

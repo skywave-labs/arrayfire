@@ -16,8 +16,11 @@
 #include <math.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1427,6 +1430,309 @@ TEST(ProductAll, BoolIn_ISSUE2543_Random_Values) {
 TEST(Product, BoolIn_ISSUE2543) {
     array A = randu(5, 5, b8);
     ASSERT_ARRAYS_EQ(allTrue(A), product(A));
+}
+
+namespace {
+
+using HostHalf = half_float::half;
+
+constexpr dim_t halfReduceLength = 257;
+
+size_t halfLinearIndex(const dim4 &dims, const dim_t x, const dim_t y,
+                       const dim_t z, const dim_t w) {
+    return static_cast<size_t>(x + dims[0] *
+                                       (y + dims[1] * (z + dims[2] * w)));
+}
+
+dim4 halfReductionDims(const dim_t width, const int dim,
+                       const dim_t reductionLength = halfReduceLength) {
+    dim4 dims(width, 2, 2, 2);
+    dims[dim] = reductionLength;
+    return dims;
+}
+
+HostHalf halfSumPattern(const size_t line, const dim_t reduced) {
+    const float values[] = {2048.0F, 1.0F,    -2048.0F, 1.0F,
+                            0.5F,    -0.25F, 0.125F};
+    return HostHalf(values[(line * 3 + static_cast<size_t>(reduced)) % 7]);
+}
+
+HostHalf halfProductPattern(const size_t line, const dim_t reduced) {
+    const float values[] = {1.0009765625F, 0.9990234375F, -1.0F, -1.0F,
+                            0.5F,          2.0F,           1.0F};
+    return HostHalf(values[(line * 5 + static_cast<size_t>(reduced)) % 7]);
+}
+
+template<typename T>
+void expectBitwiseReductionEqual(const vector<T> &expected,
+                                 const vector<T> &actual) {
+    ASSERT_EQ(expected.size(), actual.size());
+    ASSERT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                             expected.size() * sizeof(T)));
+}
+
+void checkHalfArithmetic(const dim4 &dims, const int dim,
+                         const bool replaceNaNs = false) {
+    constexpr double sumNanval     = 0.2;
+    constexpr double productNanval = 1.0001;
+    const HostHalf nan = std::numeric_limits<HostHalf>::quiet_NaN();
+
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<HostHalf> sumInput(static_cast<size_t>(dims.elements()));
+    vector<HostHalf> productInput(static_cast<size_t>(dims.elements()));
+    vector<float> expectedSum(static_cast<size_t>(outputDims.elements()));
+    vector<float> expectedProduct(
+        static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        halfLinearIndex(outputDims, x, y, z, w);
+                    float sumValue     = 0.0F;
+                    float productValue = 1.0F;
+                    for (dim_t reduced = 0; reduced < dims[dim]; ++reduced) {
+                        coords[dim] = reduced;
+                        const bool useNaN =
+                            replaceNaNs &&
+                            (reduced == 3 || reduced == dims[dim] - 2);
+                        const HostHalf sumInputValue =
+                            useNaN ? nan : halfSumPattern(outputIndex, reduced);
+                        const HostHalf productInputValue =
+                            useNaN ? nan
+                                   : halfProductPattern(outputIndex, reduced);
+                        const size_t inputIndex =
+                            halfLinearIndex(dims, coords[0], coords[1],
+                                            coords[2], coords[3]);
+                        sumInput[inputIndex]     = sumInputValue;
+                        productInput[inputIndex] = productInputValue;
+
+                        const float sumOperand =
+                            useNaN ? static_cast<float>(sumNanval)
+                                   : static_cast<float>(sumInputValue);
+                        const float productOperand =
+                            useNaN ? static_cast<float>(productNanval)
+                                   : static_cast<float>(productInputValue);
+                        sumValue     = sumOperand + sumValue;
+                        productValue = productOperand * productValue;
+                    }
+                    expectedSum[outputIndex]     = sumValue;
+                    expectedProduct[outputIndex] = productValue;
+                }
+            }
+        }
+    }
+
+    const array sumArray(dims, sumInput.data());
+    const array productArray(dims, productInput.data());
+    const array sumOutput = replaceNaNs ? af::sum(sumArray, dim, sumNanval)
+                                        : af::sum(sumArray, dim);
+    const array productOutput =
+        replaceNaNs ? af::product(productArray, dim, productNanval)
+                    : af::product(productArray, dim);
+    vector<float> actualSum(expectedSum.size());
+    vector<float> actualProduct(expectedProduct.size());
+    sumOutput.host(actualSum.data());
+    productOutput.host(actualProduct.data());
+    expectBitwiseReductionEqual(expectedSum, actualSum);
+    expectBitwiseReductionEqual(expectedProduct, actualProduct);
+}
+
+HostHalf halfExtremaPattern(const size_t line, const dim_t reduced,
+                            const dim_t reductionLength) {
+    const HostHalf nan = std::numeric_limits<HostHalf>::quiet_NaN();
+    const HostHalf inf = std::numeric_limits<HostHalf>::infinity();
+    const HostHalf sub = std::numeric_limits<HostHalf>::denorm_min();
+    switch (line % 6) {
+        case 0: return nan;
+        case 1: return reduced == reductionLength - 1 ? HostHalf(-0.0F)
+                                                      : HostHalf(0.0F);
+        case 2: return reduced == reductionLength - 1 ? HostHalf(0.0F)
+                                                      : HostHalf(-0.0F);
+        case 3:
+            if (reduced == 0) { return inf; }
+            if (reduced == 1) { return -inf; }
+            return reduced == 2 ? nan : HostHalf(1.0F);
+        case 4:
+            if (reduced % 5 == 0) { return sub; }
+            if (reduced % 5 == 1) { return -sub; }
+            return reduced % 5 == 2 ? nan : HostHalf(0.0F);
+        default:
+            return reduced % 11 == 0
+                       ? nan
+                       : HostHalf(static_cast<float>(reduced % 9) - 4.0F);
+    }
+}
+
+std::uint16_t halfBits(const HostHalf value) {
+    static_assert(sizeof(HostHalf) == sizeof(std::uint16_t),
+                  "host half must use 16-bit storage");
+    std::uint16_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+void checkHalfExtrema(const dim4 &dims, const int dim) {
+    dim4 outputDims = dims;
+    outputDims[dim] = 1;
+    vector<HostHalf> input(static_cast<size_t>(dims.elements()));
+    vector<HostHalf> expectedMin(static_cast<size_t>(outputDims.elements()));
+    vector<HostHalf> expectedMax(static_cast<size_t>(outputDims.elements()));
+
+    for (dim_t w = 0; w < outputDims[3]; ++w) {
+        for (dim_t z = 0; z < outputDims[2]; ++z) {
+            for (dim_t y = 0; y < outputDims[1]; ++y) {
+                for (dim_t x = 0; x < outputDims[0]; ++x) {
+                    dim_t coords[] = {x, y, z, w};
+                    const size_t outputIndex =
+                        halfLinearIndex(outputDims, x, y, z, w);
+                    float minValue = std::numeric_limits<float>::infinity();
+                    float maxValue = -std::numeric_limits<float>::infinity();
+                    for (dim_t reduced = 0; reduced < dims[dim]; ++reduced) {
+                        coords[dim] = reduced;
+                        const HostHalf inputValue = halfExtremaPattern(
+                            outputIndex, reduced, dims[dim]);
+                        input[halfLinearIndex(dims, coords[0], coords[1],
+                                              coords[2], coords[3])] =
+                            inputValue;
+                        float value = static_cast<float>(inputValue);
+                        if (std::isnan(value)) {
+                            minValue = std::min(
+                                std::numeric_limits<float>::infinity(),
+                                minValue);
+                            maxValue = std::max(
+                                -std::numeric_limits<float>::infinity(),
+                                maxValue);
+                        } else {
+                            minValue = std::min(value, minValue);
+                            maxValue = std::max(value, maxValue);
+                        }
+                    }
+                    expectedMin[outputIndex] = HostHalf(minValue);
+                    expectedMax[outputIndex] = HostHalf(maxValue);
+                }
+            }
+        }
+    }
+
+    const array inputArray(dims, input.data());
+    vector<HostHalf> actualMin(expectedMin.size());
+    vector<HostHalf> actualMax(expectedMax.size());
+    af::min(inputArray, dim).host(actualMin.data());
+    af::max(inputArray, dim).host(actualMax.data());
+    expectBitwiseReductionEqual(expectedMin, actualMin);
+    expectBitwiseReductionEqual(expectedMax, actualMax);
+
+    ASSERT_GE(actualMin.size(), 5U);
+    EXPECT_TRUE(std::isinf(static_cast<float>(actualMin[0])));
+    EXPECT_TRUE(std::isinf(static_cast<float>(actualMax[0])));
+    EXPECT_GT(static_cast<float>(actualMin[0]), 0.0F);
+    EXPECT_LT(static_cast<float>(actualMax[0]), 0.0F);
+    EXPECT_EQ(0x8000U, halfBits(actualMin[1]));
+    EXPECT_EQ(0x8000U, halfBits(actualMax[1]));
+    EXPECT_EQ(0U, halfBits(actualMin[2]));
+    EXPECT_EQ(0U, halfBits(actualMax[2]));
+    EXPECT_EQ(halfBits(-std::numeric_limits<HostHalf>::denorm_min()),
+              halfBits(actualMin[4]));
+    EXPECT_EQ(halfBits(std::numeric_limits<HostHalf>::denorm_min()),
+              halfBits(actualMax[4]));
+}
+
+}  // namespace
+
+TEST(ReduceHalfDimExactCpu, ArithmeticVectorAndTileTails) {
+    SUPPORTED_TYPE_CHECK(af_half);
+    SKIP_IF_FAST_MATH_ENABLED();
+    af_backend activeBackend;
+    ASSERT_SUCCESS(af_get_active_backend(&activeBackend));
+    if (activeBackend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU exact half-reduction regression";
+    }
+
+    // f16 arithmetic has 8 input lanes and 32 f32 outputs per tile.
+    // Width 43 exercises a full tile, another vector, and three scalars.
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        checkHalfArithmetic(halfReductionDims(43, dim), dim);
+        checkHalfArithmetic(halfReductionDims(24, dim), dim);
+    }
+}
+
+TEST(ReduceHalfDimExactCpu, ExtremaSpecialValuesAndTails) {
+    SUPPORTED_TYPE_CHECK(af_half);
+    SKIP_IF_FAST_MATH_ENABLED();
+    af_backend activeBackend;
+    ASSERT_SUCCESS(af_get_active_backend(&activeBackend));
+    if (activeBackend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU exact half-reduction regression";
+    }
+
+    // f16 extrema has 8 input lanes and 64 f16 outputs per tile.
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        checkHalfExtrema(halfReductionDims(75, dim), dim);
+        checkHalfExtrema(halfReductionDims(48, dim), dim);
+    }
+}
+
+TEST(ReduceHalfDimExactCpu, ArithmeticNanval) {
+    SUPPORTED_TYPE_CHECK(af_half);
+    SKIP_IF_FAST_MATH_ENABLED();
+    af_backend activeBackend;
+    ASSERT_SUCCESS(af_get_active_backend(&activeBackend));
+    if (activeBackend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU exact half-reduction regression";
+    }
+
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "dimension " << dim);
+        checkHalfArithmetic(halfReductionDims(43, dim), dim, true);
+    }
+
+    const array nanInput = constant(
+        std::numeric_limits<float>::quiet_NaN(), dim4(8, 512), f16);
+    vector<float> sumOutput(8);
+    vector<float> productOutput(8);
+    af::sum(nanInput, 1).host(sumOutput.data());
+    af::product(nanInput, 1).host(productOutput.data());
+    for (size_t i = 0; i < sumOutput.size(); ++i) {
+        EXPECT_TRUE(std::isnan(sumOutput[i]));
+        EXPECT_TRUE(std::isnan(productOutput[i]));
+    }
+}
+
+TEST(ReduceHalfDimExactCpu, DimZeroAndSmallFallbacks) {
+    SUPPORTED_TYPE_CHECK(af_half);
+    SKIP_IF_FAST_MATH_ENABLED();
+    af_backend activeBackend;
+    ASSERT_SUCCESS(af_get_active_backend(&activeBackend));
+    if (activeBackend != AF_BACKEND_CPU) {
+        GTEST_SKIP() << "CPU exact half-reduction regression";
+    }
+
+    // This input is above the SIMD threshold, but dim 0 remains on the
+    // established scalar path.
+    const dim4 dimZeroDims(257, 5, 4, 1);
+    checkHalfArithmetic(dimZeroDims, 0);
+    checkHalfExtrema(dimZeroDims, 0);
+
+    // Inputs below the SIMD threshold exercise the unchanged fallback for
+    // every nonzero dimension.
+    for (int dim = 1; dim <= 3; ++dim) {
+        SCOPED_TRACE(::testing::Message() << "small dimension " << dim);
+        const dim4 dims = halfReductionDims(11, dim, 17);
+        checkHalfArithmetic(dims, dim);
+        checkHalfExtrema(dims, dim);
+
+        // This is above the input threshold, but too narrow for one
+        // eight-element half vector.
+        const dim4 narrowDims = halfReductionDims(7, dim, 1024);
+        checkHalfArithmetic(narrowDims, dim);
+        checkHalfExtrema(narrowDims, dim);
+    }
 }
 
 struct reduce_params {
