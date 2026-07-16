@@ -59,6 +59,29 @@ void reduceDimMaxRangeAVX2(Param<double> out, CParam<double> in, int dim,
                            bool change_nan, double nanval, size_t tile_begin,
                            size_t tile_end) noexcept;
 
+// Integral reductions use separate entry points because 8- and 16-bit sum
+// and product inputs are widened to 32-bit outputs by the public API.
+template<typename Ti, typename To>
+void reduceDimIntegerSumRangeAVX2(Param<To> out, CParam<Ti> in, int dim,
+                                  bool change_nan, double nanval,
+                                  size_t tile_begin, size_t tile_end) noexcept;
+
+template<typename Ti, typename To>
+void reduceDimIntegerProductRangeAVX2(Param<To> out, CParam<Ti> in, int dim,
+                                      bool change_nan, double nanval,
+                                      size_t tile_begin,
+                                      size_t tile_end) noexcept;
+
+template<typename T>
+void reduceDimIntegerMinRangeAVX2(Param<T> out, CParam<T> in, int dim,
+                                  bool change_nan, double nanval,
+                                  size_t tile_begin, size_t tile_end) noexcept;
+
+template<typename T>
+void reduceDimIntegerMaxRangeAVX2(Param<T> out, CParam<T> in, int dim,
+                                  bool change_nan, double nanval,
+                                  size_t tile_begin, size_t tile_end) noexcept;
+
 }  // namespace detail
 }  // namespace kernel
 }  // namespace cpu
