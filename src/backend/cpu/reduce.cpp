@@ -11,6 +11,7 @@
 #include <common/Binary.hpp>
 #include <common/Transform.hpp>
 #include <common/half.hpp>
+#include <common/util.hpp>
 #include <kernel/reduce.hpp>
 #include <platform.hpp>
 #include <queue.hpp>
@@ -19,6 +20,7 @@
 
 #include <complex>
 #include <functional>
+#include <string>
 
 using af::dim4;
 using arrayfire::common::Binary;
@@ -40,6 +42,24 @@ struct Binary<cdouble, af_add_t> {
 
 }  // namespace common
 namespace cpu {
+
+namespace {
+
+bool allowReduceAllReassociation() {
+    static const bool allow = []() {
+        const std::string configured =
+            common::getEnvVar("AF_CPU_REDUCE_ALL_REASSOCIATE");
+        if (!configured.empty()) { return configured == "1"; }
+#ifdef AF_WITH_FAST_MATH
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return allow;
+}
+
+}  // namespace
 
 namespace kernel {
 namespace detail {
@@ -154,9 +174,29 @@ Array<To> reduce_all(const Array<Ti> &in, bool change_nan, double nanval) {
     in.eval();
 
     Array<To> out = createEmptyArray<To>(1);
-    static const reduce_all_func<op, Ti, To> reduce_all_kernel =
-        kernel::reduce_all<op, Ti, To>();
-    getQueue().enqueue(reduce_all_kernel, out, in, change_nan, nanval);
+    using reduce_all_kernel_type = kernel::reduce_all<op, Ti, To>;
+    static const reduce_all_func<op, Ti, To> default_reduce_all_kernel =
+        reduce_all_kernel_type();
+    if constexpr (reduce_all_kernel_type::reassociable_floating_reduction) {
+        // Small reductions must not freeze the process-wide environment choice.
+        if (static_cast<size_t>(in.elements()) >=
+            reduce_all_kernel_type::min_reassociated_elements) {
+            static const reduce_all_func<op, Ti, To> reduce_all_kernel = []() {
+                if (allowReduceAllReassociation()) {
+                    return reduce_all_func<op, Ti, To>(
+                        kernel::reduce_all_reassociated<op, Ti, To>());
+                }
+                return reduce_all_func<op, Ti, To>(reduce_all_kernel_type());
+            }();
+            getQueue().enqueue(reduce_all_kernel, out, in, change_nan, nanval);
+        } else {
+            getQueue().enqueue(default_reduce_all_kernel, out, in, change_nan,
+                               nanval);
+        }
+    } else {
+        getQueue().enqueue(default_reduce_all_kernel, out, in, change_nan,
+                           nanval);
+    }
     getQueue().sync();
     return out;
 }
