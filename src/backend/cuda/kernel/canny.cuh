@@ -10,11 +10,6 @@
 #include <Param.hpp>
 #include <math.hpp>
 
-// hasChanged is a variable in kernel space
-// used to track the convergence of
-// the breath first search algorithm
-__device__ int hasChanged = 0;
-
 namespace arrayfire {
 namespace cuda {
 
@@ -172,7 +167,8 @@ __global__ void initEdgeOut(Param<T> output, CParam<T> strong, CParam<T> weak,
      (i) < (SHRD_MEM_WIDTH - 1))
 
 template<typename T>
-__global__ void edgeTrack(Param<T> output, unsigned nBBS0, unsigned nBBS1) {
+__global__ void edgeTrack(Param<T> output, int* hasChanged, unsigned nBBS0,
+                          unsigned nBBS1) {
     const unsigned SHRD_MEM_WIDTH  = THREADS_X + 2;  // Cols
     const unsigned SHRD_MEM_HEIGHT = THREADS_Y + 2;  // Rows
 
@@ -265,7 +261,7 @@ __global__ void edgeTrack(Param<T> output, unsigned nBBS0, unsigned nBBS1) {
 
     // Check if any 1-pixel border ring
     // has weak pixels with strong candidates
-    // within the main region, then increment hasChanged.
+    // within the main region, then request another launch.
     int cu = outMem[j][i];
     int nw = outMem[j - 1][i - 1];
     int no = outMem[j - 1][i];
@@ -282,7 +278,7 @@ __global__ void edgeTrack(Param<T> output, unsigned nBBS0, unsigned nBBS1) {
 
     if (__syncthreads_or(cu == STRONG && hasWeakNeighbour) && lx == 0 &&
         ly == 0)
-        atomicAdd(&hasChanged, 1);
+        atomicExch(hasChanged, 1);
 
     // Update output with shared memory result
     if (gx < (output.dims[0] - 2) && gy < (output.dims[1] - 2))

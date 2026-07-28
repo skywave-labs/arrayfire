@@ -5,9 +5,10 @@
 #       - "Auto" detects local machine GPU compute arch at runtime.
 #       - "Common" and "All" cover common and entire subsets of architectures
 #      ARCH_AND_PTX : NAME | NUM.NUM | NUM.NUM(NUM.NUM) | NUM.NUM+PTX
-#      NAME: Fermi Kepler Maxwell Kepler+Tegra Kepler+Tesla Maxwell+Tegra Pascal Volta Turing Ampere
+#      NAME: Fermi Kepler Maxwell Kepler+Tegra Kepler+Tesla Maxwell+Tegra Pascal Volta Turing Ampere Hopper Blackwell
 #      NUM: Any number. Only those pairs are currently accepted by NVCC though:
-#            2.0 2.1 3.0 3.2 3.5 3.7 5.0 5.2 5.3 6.0 6.2 7.0 7.2 7.5 8.0 8.6 9.0
+#            2.0 2.1 3.0 3.2 3.5 3.7 5.0 5.2 5.3 6.0 6.2 7.0 7.2 7.5
+#            8.0 8.6 8.7 8.8 8.9 9.0 10.0 10.1 10.3 11.0 12.0 12.1
 #      Returns LIST of flags to be added to CUDA_NVCC_FLAGS in ${out_variable}
 #      Additionally, sets ${out_variable}_readable to the resulting numeric list
 #      Example:
@@ -92,6 +93,10 @@ if(CUDA_VERSION VERSION_GREATER_EQUAL "11.1")
   set(CUDA_LIMIT_GPU_ARCHITECTURE "9.0")
 endif()
 
+if(CUDA_VERSION VERSION_GREATER_EQUAL "11.4")
+  list(APPEND CUDA_ALL_GPU_ARCHITECTURES "8.7")
+endif()
+
 if(CUDA_VERSION VERSION_GREATER_EQUAL "11.8")
   list(APPEND CUDA_COMMON_GPU_ARCHITECTURES "8.9")
   list(APPEND CUDA_ALL_GPU_ARCHITECTURES "8.9")
@@ -109,6 +114,38 @@ if(CUDA_VERSION VERSION_GREATER_EQUAL "12.0")
   set(CUDA_LIMIT_GPU_ARCHITECTURE "9.0")
 
   list(REMOVE_ITEM CUDA_ALL_GPU_ARCHITECTURES "3.5" "3.7")
+endif()
+
+if(CUDA_VERSION VERSION_GREATER_EQUAL "12.8")
+  list(APPEND CUDA_KNOWN_GPU_ARCHITECTURES "Blackwell")
+  list(APPEND CUDA_COMMON_GPU_ARCHITECTURES "10.0" "10.1" "12.0")
+  list(APPEND CUDA_ALL_GPU_ARCHITECTURES "10.0" "10.1" "12.0")
+
+  set(_CUDA_MAX_COMMON_ARCHITECTURE "12.0+PTX")
+  set(CUDA_LIMIT_GPU_ARCHITECTURE "12.1")
+endif()
+
+if(CUDA_VERSION VERSION_GREATER_EQUAL "12.9")
+  # CUDA 12.9 added sm_103 and sm_121.
+  list(REMOVE_ITEM CUDA_COMMON_GPU_ARCHITECTURES "12.0")
+  list(APPEND CUDA_COMMON_GPU_ARCHITECTURES "10.3" "12.0" "12.1")
+  list(REMOVE_ITEM CUDA_ALL_GPU_ARCHITECTURES "12.0")
+  list(APPEND CUDA_ALL_GPU_ARCHITECTURES "10.3" "12.0" "12.1")
+
+  set(_CUDA_MAX_COMMON_ARCHITECTURE "12.1+PTX")
+  set(CUDA_LIMIT_GPU_ARCHITECTURE "12.2")
+endif()
+
+if(CUDA_VERSION VERSION_GREATER_EQUAL "13.0")
+  # CUDA 13 renamed sm_101 to sm_110 and removed offline compilation for
+  # architectures older than Turing.
+  set(CUDA_KNOWN_GPU_ARCHITECTURES "Turing" "Ampere" "Hopper" "Blackwell")
+  set(CUDA_COMMON_GPU_ARCHITECTURES
+      "7.5" "8.0" "8.6" "8.8" "8.9" "9.0"
+      "10.0" "10.3" "11.0" "12.0" "12.1")
+  set(CUDA_ALL_GPU_ARCHITECTURES
+      "7.5" "8.0" "8.6" "8.7" "8.8" "8.9" "9.0"
+      "10.0" "10.3" "11.0" "12.0" "12.1")
 endif()
 
 list(APPEND CUDA_COMMON_GPU_ARCHITECTURES "${_CUDA_MAX_COMMON_ARCHITECTURE}")
@@ -177,15 +214,32 @@ function(CUDA_DETECT_INSTALLED_GPUS OUT_VARIABLE)
     message(STATUS "Automatic GPU detection failed. Building for common architectures.")
     set(${OUT_VARIABLE} ${CUDA_COMMON_GPU_ARCHITECTURES} PARENT_SCOPE)
   else()
-    # Filter based on CUDA version supported archs
+    # Filter against the toolkit's exact target set. Recent Blackwell target
+    # sets contain holes, so a scalar maximum is insufficient.
     set(CUDA_GPU_DETECT_OUTPUT_FILTERED "")
     separate_arguments(CUDA_GPU_DETECT_OUTPUT)
     foreach(ITEM IN ITEMS ${CUDA_GPU_DETECT_OUTPUT})
-        if(CUDA_LIMIT_GPU_ARCHITECTURE AND ITEM VERSION_GREATER_EQUAL CUDA_LIMIT_GPU_ARCHITECTURE)
-        list(GET CUDA_COMMON_GPU_ARCHITECTURES -1 NEWITEM)
-        string(APPEND CUDA_GPU_DETECT_OUTPUT_FILTERED " ${NEWITEM}")
+      if(ITEM MATCHES "^([0-9]+\\.[0-9]+)(\\([0-9]+\\.[0-9]+\\))?$")
+        set(ITEM_ARCHITECTURE "${CMAKE_MATCH_1}")
       else()
+        set(ITEM_ARCHITECTURE "${ITEM}")
+      endif()
+
+      list(FIND CUDA_ALL_GPU_ARCHITECTURES "${ITEM_ARCHITECTURE}" SUPPORTED_INDEX)
+      if(NOT SUPPORTED_INDEX EQUAL -1)
         string(APPEND CUDA_GPU_DETECT_OUTPUT_FILTERED " ${ITEM}")
+      else()
+        set(COMPATIBLE_ARCHITECTURE "")
+        foreach(SUPPORTED IN LISTS CUDA_ALL_GPU_ARCHITECTURES)
+          if(NOT SUPPORTED VERSION_GREATER ITEM_ARCHITECTURE)
+            set(COMPATIBLE_ARCHITECTURE "${SUPPORTED}")
+          endif()
+        endforeach()
+        if(COMPATIBLE_ARCHITECTURE STREQUAL "")
+          list(GET CUDA_ALL_GPU_ARCHITECTURES 0 COMPATIBLE_ARCHITECTURE)
+        endif()
+        string(APPEND CUDA_GPU_DETECT_OUTPUT_FILTERED
+               " ${COMPATIBLE_ARCHITECTURE}+PTX")
       endif()
     endforeach()
 
@@ -209,7 +263,7 @@ function(CUDA_SELECT_NVCC_ARCH_FLAGS out_variable)
   set(cuda_arch_ptx)
 
   if("${CUDA_ARCH_LIST}" STREQUAL "All")
-    set(CUDA_ARCH_LIST ${CUDA_KNOWN_GPU_ARCHITECTURES})
+    set(CUDA_ARCH_LIST ${CUDA_ALL_GPU_ARCHITECTURES})
   elseif("${CUDA_ARCH_LIST}" STREQUAL "Common")
     set(CUDA_ARCH_LIST ${CUDA_COMMON_GPU_ARCHITECTURES})
   elseif("${CUDA_ARCH_LIST}" STREQUAL "Auto")
@@ -229,7 +283,7 @@ function(CUDA_SELECT_NVCC_ARCH_FLAGS out_variable)
       set(add_ptx TRUE)
       set(arch_name ${CMAKE_MATCH_1})
     endif()
-    if(arch_name MATCHES "^([0-9]\\.[0-9](\\([0-9]\\.[0-9]\\))?)$")
+    if(arch_name MATCHES "^([0-9]+\\.[0-9]+(\\([0-9]+\\.[0-9]+\\))?)$")
       set(arch_bin ${CMAKE_MATCH_1})
       set(arch_ptx ${arch_bin})
     else()
@@ -268,6 +322,17 @@ function(CUDA_SELECT_NVCC_ARCH_FLAGS out_variable)
       elseif(${arch_name} STREQUAL "Hopper")
         set(arch_bin 9.0)
         set(arch_ptx 9.0)
+      elseif(${arch_name} STREQUAL "Blackwell")
+        if(CUDA_VERSION VERSION_GREATER_EQUAL "13.0")
+          set(arch_bin 10.0 10.3 11.0 12.0 12.1)
+          set(arch_ptx 12.1)
+        elseif(CUDA_VERSION VERSION_GREATER_EQUAL "12.9")
+          set(arch_bin 10.0 10.1 10.3 12.0 12.1)
+          set(arch_ptx 12.1)
+        else()
+          set(arch_bin 10.0 10.1 12.0)
+          set(arch_ptx 12.0)
+        endif()
       else()
         message(SEND_ERROR "Unknown CUDA Architecture Name ${arch_name} in CUDA_SELECT_NVCC_ARCH_FLAGS")
       endif()

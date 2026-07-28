@@ -14,6 +14,7 @@
 #include <common/dispatch.hpp>
 #include <common/kernel_cache.hpp>
 #include <debug_cuda.hpp>
+#include <memory.hpp>
 #include <nvrtc_kernel_headers/flood_fill_cuh.hpp>
 
 namespace arrayfire {
@@ -57,6 +58,8 @@ void floodFill(Param<T> out, CParam<T> image, CParam<uint> seedsx,
         "arrayfire::cuda::finalizeOutput", {{flood_fill_cuh_src}},
         TemplateArgs(TemplateTypename<T>()));
 
+    auto continueFlag = memAlloc<int>(1);
+
     EnqueueArgs qArgs(dim3(divup(seedsx.elements(), THREADS)), dim3(THREADS),
                       getActiveStream());
     initSeeds(qArgs, out, seedsx, seedsy);
@@ -67,14 +70,16 @@ void floodFill(Param<T> out, CParam<T> image, CParam<uint> seedsx,
                 divup(image.dims[1], threads.y));
     EnqueueArgs fQArgs(blocks, threads, getActiveStream());
 
-    auto continueFlagPtr = floodStep.getDevPtr("doAnotherLaunch");
-
     for (int doAnotherLaunch = 1; doAnotherLaunch > 0;) {
         doAnotherLaunch = 0;
-        floodStep.setFlag(continueFlagPtr, &doAnotherLaunch);
-        floodStep(fQArgs, out, image, lowValue, highValue);
+        CUDA_CHECK(cudaMemsetAsync(continueFlag.get(), 0, sizeof(int),
+                                   getActiveStream()));
+        floodStep(fQArgs, out, image, lowValue, highValue, continueFlag.get());
         POST_LAUNCH_CHECK();
-        doAnotherLaunch = floodStep.getFlag(continueFlagPtr);
+        CUDA_CHECK(cudaMemcpyAsync(&doAnotherLaunch, continueFlag.get(),
+                                   sizeof(int), cudaMemcpyDeviceToHost,
+                                   getActiveStream()));
+        CUDA_CHECK(cudaStreamSynchronize(getActiveStream()));
     }
     finalizeOutput(fQArgs, out, newValue);
     POST_LAUNCH_CHECK();

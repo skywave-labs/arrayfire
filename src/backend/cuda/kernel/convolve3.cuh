@@ -11,9 +11,6 @@
 #include <math.hpp>
 #include <shared.hpp>
 
-__constant__ char cFilter[2 * (2 * (MAX_CONV1_FILTER_LEN - 1) + CONV_THREADS) *
-                          sizeof(double)];
-
 namespace arrayfire {
 namespace cuda {
 
@@ -22,8 +19,9 @@ __inline__ int index(int i, int j, int k, int jstride, int kstride) {
 }
 
 template<typename T, typename aT, bool expand>
-__global__ void convolve3(Param<T> out, CParam<T> signal, int fLen0, int fLen1,
-                          int fLen2, int nBBS, int o3, int s3) {
+__global__ void convolve3(Param<T> out, CParam<T> signal, const aT *filter,
+                          int fLen0, int fLen1, int fLen2, int nBBS, int o3,
+                          int s3) {
     SharedMemory<T> shared;
 
     T *shrdMem   = shared.getPointer();
@@ -46,7 +44,10 @@ __global__ void convolve3(Param<T> out, CParam<T> signal, int fLen0, int fLen1,
         (b2 * signal.strides[3] + /* activated with batched input signal */
          s3 * signal.strides[3]); /* activated with batched input filter */
 
-    const aT *impulse = (const aT *)cFilter;
+    // The largest cdouble signal tile already occupies the full 48 KiB shared
+    // memory budget. Keep this per-launch pointer in the read-only cache rather
+    // than reintroducing mutable module-global state.
+    const aT *impulse = filter;
 
     int lx = threadIdx.x;
     int ly = threadIdx.y;

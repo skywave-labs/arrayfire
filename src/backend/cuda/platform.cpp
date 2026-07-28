@@ -529,8 +529,11 @@ cudnnHandle_t nnHandle() {
     // the module is not loaded correctly
     static cudnnModule keep_me_to_avoid_exceptions_exceptions =
         getCudnnPlugin();
-    static unique_handle<cudnnHandle_t> *handle =
-        nnManager(getActiveDeviceId());
+    thread_local unique_handle<cudnnHandle_t>
+        *handles[DeviceManager::MAX_DEVICES] = {};
+    const int deviceId                       = getActiveDeviceId();
+    if (!handles[deviceId]) { handles[deviceId] = nnManager(deviceId); }
+    unique_handle<cudnnHandle_t> *handle = handles[deviceId];
     if (*handle) {
         return *handle;
     } else {

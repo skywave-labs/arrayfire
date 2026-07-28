@@ -46,7 +46,7 @@ else()
 endif()
 
 set(CUDA_architecture_build_targets "Auto" CACHE
-  STRING "The compute architectures targeted by this build. (Options: Auto;3.0;Maxwell;All;Common)")
+  STRING "CUDA architectures targeted by this build (for example: Auto;Common;Blackwell;12.0;12.0+PTX)")
 
 find_cuda_helper_libs(nvrtc)
 find_cuda_helper_libs(nvrtc-builtins)

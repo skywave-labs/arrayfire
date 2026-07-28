@@ -10,9 +10,6 @@
 #include <Param.hpp>
 #include <interp.hpp>
 
-__constant__ float
-    c_tmat[3072];  // Allows 512 Affine Transforms and 340 Persp. Transforms
-
 namespace arrayfire {
 namespace cuda {
 
@@ -57,11 +54,11 @@ __device__ void calc_transf_inverse(T *txo, const T *txi,
 }
 
 template<typename T, bool inverse, int order>
-__global__ void transform(Param<T> out, CParam<T> in, const int nImg2,
-                          const int nImg3, const int nTfs2, const int nTfs3,
-                          const int batchImg2, const int blocksXPerImage,
-                          const int blocksYPerImage, const bool perspective,
-                          af::interpType method) {
+__global__ void transform(Param<T> out, CParam<T> in, const float *transforms,
+                          const int nImg2, const int nImg3, const int nTfs2,
+                          const int nTfs3, const int batchImg2,
+                          const int blocksXPerImage, const int blocksYPerImage,
+                          const bool perspective, af::interpType method) {
     // Image Ids
     const int imgId2 = blockIdx.x / blocksXPerImage;
     const int imgId3 = blockIdx.y / blocksYPerImage;
@@ -76,8 +73,6 @@ __global__ void transform(Param<T> out, CParam<T> in, const int nImg2,
 
     // Image iteration loop count for image batching
     int limages = min(max(out.dims[2] - imgId2 * nImg2, 1), batchImg2);
-
-    if (xido >= out.dims[0] || yido >= out.dims[1]) return;
 
     // Index of transform
     const int eTfs2 = max((nTfs2 / nImg2), 1);
@@ -113,6 +108,18 @@ __global__ void transform(Param<T> out, CParam<T> in, const int nImg2,
     const int t_idx = t_idx2 + t_idx3 * nTfs2;
     int outoff      = 0;
 
+    const int transf_len = (perspective ? 9 : 6);
+    __shared__ float block_tmat[9];
+    const int threadId = threadIdx.y * blockDim.x + threadIdx.x;
+    // A block uses one transform. Stage its launch-local coefficients here
+    // instead of copying all transforms into mutable module-global memory.
+    if (threadId < transf_len) {
+        block_tmat[threadId] = transforms[t_idx * transf_len + threadId];
+    }
+    __syncthreads();
+
+    if (xido >= out.dims[0] || yido >= out.dims[1]) return;
+
     // Global offsets
     const int inoff =
         imgId2 * batchImg2 * in.strides[2] + imgId3 * in.strides[3];
@@ -128,9 +135,7 @@ __global__ void transform(Param<T> out, CParam<T> in, const int nImg2,
         outoff += t_idx3 * out.strides[3];
     }
 
-    // Transform is in constant memory.
-    const int transf_len  = (perspective ? 9 : 6);
-    const float *tmat_ptr = c_tmat + t_idx * transf_len;
+    const float *tmat_ptr = block_tmat;
     float tmat[9];
 
     // We expect a inverse transform matrix by default

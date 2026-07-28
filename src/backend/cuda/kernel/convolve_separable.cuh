@@ -10,20 +10,18 @@
 #include <Param.hpp>
 #include <math.hpp>
 
-__constant__ char sFilter[2 * SCONV_THREADS_Y *
-                          (2 * (MAX_SCONV_FILTER_LEN - 1) + SCONV_THREADS_X) *
-                          sizeof(double)];
-
 namespace arrayfire {
 namespace cuda {
 
 template<typename T, typename accType, int conv_dim, bool expand, int fLen>
-__global__ void convolve2_separable(Param<T> out, CParam<T> signal, int nBBS0,
+__global__ void convolve2_separable(Param<T> out, CParam<T> signal,
+                                    const accType *filter, int nBBS0,
                                     int nBBS1) {
     const int smem_len =
         (conv_dim == 0 ? (SCONV_THREADS_X + 2 * (fLen - 1)) * SCONV_THREADS_Y
                        : (SCONV_THREADS_Y + 2 * (fLen - 1)) * SCONV_THREADS_X);
     __shared__ T shrdMem[smem_len];
+    __shared__ accType impulse[fLen];
 
     const int radius  = fLen - 1;
     const int padding = 2 * radius;
@@ -38,14 +36,18 @@ __global__ void convolve2_separable(Param<T> out, CParam<T> signal, int nBBS0,
     T *dst       = (T *)out.ptr + (b2 * out.strides[2] + b3 * out.strides[3]);
     const T *src = (const T *)signal.ptr +
                    (b2 * signal.strides[2] + b3 * signal.strides[3]);
-    const accType *impulse = (const accType *)sFilter;
-
     int lx = threadIdx.x;
     int ly = threadIdx.y;
     int ox = SCONV_THREADS_X * (blockIdx.x - b2 * nBBS0) + lx;
     int oy = SCONV_THREADS_Y * (blockIdx.y - b3 * nBBS1) + ly;
     int gx = ox;
     int gy = oy;
+
+    const int threadId = ly * blockDim.x + lx;
+    const int nThreads = blockDim.x * blockDim.y;
+    // Stage this launch's filter once per block instead of mutating a
+    // module-global constant buffer shared by concurrent host calls.
+    for (int i = threadId; i < fLen; i += nThreads) { impulse[i] = filter[i]; }
 
     // below if-else statement is based on template parameter
     if (conv_dim == 0) {

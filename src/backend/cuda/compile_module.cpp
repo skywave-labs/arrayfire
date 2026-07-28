@@ -437,14 +437,12 @@ Module loadModuleFromDisk(const int device, const string &moduleKey,
             for (size_t i = 0; i < mangledListSize; ++i) {
                 size_t keySize = 0;
                 in.read(reinterpret_cast<char *>(&keySize), sizeof(keySize));
-                vector<char> key;
-                key.reserve(keySize);
+                vector<char> key(keySize);
                 in.read(key.data(), keySize);
 
                 size_t itemSize = 0;
                 in.read(reinterpret_cast<char *>(&itemSize), sizeof(itemSize));
-                vector<char> item;
-                item.reserve(itemSize);
+                vector<char> item(itemSize);
                 in.read(item.data(), itemSize);
 
                 retVal.add(string(key.data(), keySize),

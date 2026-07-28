@@ -101,8 +101,11 @@ static const int jetsonComputeCapabilities[] = {
 
 // clang-format off
 static const cuNVRTCcompute Toolkit2MaxCompute[] = {
-    {12090, 9, 0, 0},
-    {12080, 9, 0, 0},
+    {13020, 12, 1, 0},
+    {13010, 12, 1, 0},
+    {13000, 12, 1, 0},
+    {12090, 12, 1, 0},
+    {12080, 12, 0, 0},
     {12070, 9, 0, 0},
     {12060, 9, 0, 0},
     {12050, 9, 0, 0},
@@ -113,9 +116,9 @@ static const cuNVRTCcompute Toolkit2MaxCompute[] = {
     {12000, 9, 0, 0},
     {11080, 9, 0, 0},
     {11070, 8, 7, 0},
-    {11060, 8, 6, 0},
-    {11050, 8, 6, 0},
-    {11040, 8, 6, 0},
+    {11060, 8, 7, 0},
+    {11050, 8, 7, 0},
+    {11040, 8, 7, 0},
     {11030, 8, 6, 0},
     {11020, 8, 6, 0},
     {11010, 8, 6, 0},
@@ -147,6 +150,9 @@ struct ComputeCapabilityToStreamingProcessors {
 // clang-format off
 static const ToolkitDriverVersions
     CudaToDriverVersion[] = {
+        {13020, 580.00f, 580.00f},
+        {13010, 580.00f, 580.00f},
+        {13000, 580.00f, 580.00f},
         {12090, 525.60f, 528.33f},
         {12080, 525.60f, 528.33f},
         {12070, 525.60f, 528.33f},
@@ -177,16 +183,46 @@ static const ToolkitDriverVersions
         {7000,  346.46f, 347.62f}};
 // clang-format on
 
-// Vector of minimum supported compute versions for CUDA toolkit (i+1).*
-// where i is the index of the vector
-static const std::array<int, 12> minSV{{1, 1, 1, 1, 1, 1, 2, 2, 3, 3, 3, 5}};
+// Minimum supported compute capability for CUDA toolkit (i+1).*, where i is
+// the index of the array. CUDA 13 dropped offline compilation before Turing.
+static const std::array<pair<int, int>, 13> minSV{{
+    {1, 0},
+    {1, 0},
+    {1, 0},
+    {1, 0},
+    {1, 0},
+    {1, 0},
+    {2, 0},
+    {2, 0},
+    {3, 0},
+    {3, 0},
+    {3, 0},
+    {5, 0},
+    {7, 5},
+}};
+
+// NVRTC target sets became sparse with Blackwell. Keep the exact modern
+// toolkit sets here so device detection never passes an unsupported target
+// through merely because it is below the toolkit's scalar maximum.
+static const pair<int, int> cuda128Targets[] = {
+    {5, 0}, {5, 2}, {5, 3}, {6, 0}, {6, 1}, {6, 2},  {7, 0},  {7, 2}, {7, 5},
+    {8, 0}, {8, 6}, {8, 7}, {8, 9}, {9, 0}, {10, 0}, {10, 1}, {12, 0}};
+static const pair<int, int> cuda129Targets[] = {
+    {5, 0},  {5, 2},  {5, 3},  {6, 0},  {6, 1}, {6, 2}, {7, 0},
+    {7, 2},  {7, 5},  {8, 0},  {8, 6},  {8, 7}, {8, 9}, {9, 0},
+    {10, 0}, {10, 1}, {10, 3}, {12, 0}, {12, 1}};
+static const pair<int, int> cuda13Targets[] = {
+    {7, 5}, {8, 0},  {8, 6},  {8, 7},  {8, 8},  {8, 9},
+    {9, 0}, {10, 0}, {10, 3}, {11, 0}, {12, 0}, {12, 1}};
 
 static ComputeCapabilityToStreamingProcessors gpus[] = {
     {0x10, 8},   {0x11, 8},   {0x12, 8},   {0x13, 8},   {0x20, 32},
     {0x21, 48},  {0x30, 192}, {0x32, 192}, {0x35, 192}, {0x37, 192},
     {0x50, 128}, {0x52, 128}, {0x53, 128}, {0x60, 64},  {0x61, 128},
     {0x62, 128}, {0x70, 64},  {0x75, 64},  {0x80, 64},  {0x86, 128},
-    {0x87, 128}, {0x89, 128}, {0x90, 128}, {-1, -1},
+    {0x87, 128}, {0x88, 128}, {0x89, 128}, {0x90, 128}, {0xA0, 128},
+    {0xA1, 128}, {0xA3, 128}, {0xB0, 128}, {0xC0, 128}, {0xC1, 128},
+    {-1, -1},
 };
 
 // pulled from CUTIL from CUDA SDK
@@ -200,10 +236,41 @@ static inline int compute2cores(unsigned major, unsigned minor) {
     return 0;
 }
 
-static inline int getMinSupportedCompute(int cudaMajorVer) {
-    int CVSize = static_cast<int>(minSV.size());
-    return (cudaMajorVer > CVSize ? minSV[CVSize - 1]
-                                  : minSV[cudaMajorVer - 1]);
+static inline pair<int, int> getMinSupportedCompute(int cudaMajorVer) {
+    if (cudaMajorVer <= 0) { return minSV.front(); }
+    const auto version =
+        std::min(static_cast<size_t>(cudaMajorVer), minSV.size());
+    return minSV[version - 1];
+}
+
+static pair<int, int> getCompatibleCompute(int runtime, pair<int, int> compute,
+                                           bool embedded,
+                                           const cuNVRTCcompute &toolkit) {
+    const int minor       = embedded ? toolkit.embedded_minor : toolkit.minor;
+    const auto maxCompute = make_pair(toolkit.major, minor);
+    if (compute > maxCompute) { compute = maxCompute; }
+
+    const pair<int, int> *targetsBegin = nullptr;
+    const pair<int, int> *targetsEnd   = nullptr;
+    if (runtime >= 13000) {
+        targetsBegin = begin(cuda13Targets);
+        targetsEnd   = end(cuda13Targets);
+    } else if (runtime >= 12090) {
+        targetsBegin = begin(cuda129Targets);
+        targetsEnd   = end(cuda129Targets);
+    } else if (runtime >= 12080) {
+        targetsBegin = begin(cuda128Targets);
+        targetsEnd   = end(cuda128Targets);
+    } else {
+        return compute;
+    }
+
+    pair<int, int> compatible = *targetsBegin;
+    for (auto target = targetsBegin; target != targetsEnd; ++target) {
+        if (*target > compute) { break; }
+        compatible = *target;
+    }
+    return compatible;
 }
 
 bool isEmbedded(pair<int, int> compute) {
@@ -214,6 +281,8 @@ bool isEmbedded(pair<int, int> compute) {
 }
 
 bool checkDeviceWithRuntime(int runtime, pair<int, int> compute) {
+    if (compute < getMinSupportedCompute(runtime / 1000)) { return false; }
+
     auto rt = find_if(
         begin(Toolkit2MaxCompute), end(Toolkit2MaxCompute),
         [runtime](cuNVRTCcompute c) { return c.cudaVersion == runtime; });
@@ -225,18 +294,11 @@ bool checkDeviceWithRuntime(int runtime, pair<int, int> compute) {
                 "to update the Toolkit2MaxCompute array with this version of "
                 "the CUDA Runtime. Continuing.",
                 fromCudaVersion(runtime));
-        return true;
+        rt = begin(Toolkit2MaxCompute);
     }
 
-    if (rt->major >= compute.first) {
-        if (rt->major == compute.first) {
-            return rt->minor >= compute.second;
-        } else {
-            return true;
-        }
-    } else {
-        return false;
-    }
+    return compute ==
+           getCompatibleCompute(runtime, compute, isEmbedded(compute), *rt);
 }
 
 /// Check for compatible compute version based on runtime cuda toolkit version
@@ -248,50 +310,35 @@ void checkAndSetDevMaxCompute(pair<int, int> &computeCapability) {
         begin(Toolkit2MaxCompute), end(Toolkit2MaxCompute),
         [rtCudaVer](cuNVRTCcompute v) { return rtCudaVer == v.cudaVersion; });
 
-    bool embeddedDevice = isEmbedded(computeCapability);
+    const bool knownToolkit = tkitMaxCompute != end(Toolkit2MaxCompute);
+    const auto &toolkit =
+        knownToolkit ? *tkitMaxCompute : Toolkit2MaxCompute[0];
+    computeCapability = getCompatibleCompute(
+        rtCudaVer, computeCapability, isEmbedded(computeCapability), toolkit);
 
-    // If runtime cuda version is found in toolkit array
-    // check for max possible compute for that cuda version
-    if (tkitMaxCompute != end(Toolkit2MaxCompute) &&
-        computeCapability.first >= tkitMaxCompute->major) {
-        int minorVersion = embeddedDevice ? tkitMaxCompute->embedded_minor
-                                          : tkitMaxCompute->minor;
-
-        if (computeCapability.second > minorVersion) {
-            computeCapability = make_pair(tkitMaxCompute->major, minorVersion);
+    if (computeCapability != originalCompute) {
+        if (knownToolkit) {
             spdlog::get("platform")
                 ->warn(
-                    "The compute capability for the current device({}.{}) "
-                    "exceeds maximum supported by ArrayFire's CUDA "
-                    "runtime({}.{}). Download or rebuild the latest version of "
-                    "ArrayFire to avoid this warning. Using {}.{} for JIT "
-                    "compilation kernels.",
+                    "The compute capability for the current device({}.{}) is "
+                    "not an NVRTC target supported by CUDA runtime({}). Using "
+                    "{}.{} for JIT compilation kernels.",
                     originalCompute.first, originalCompute.second,
-                    computeCapability.first, computeCapability.second,
-                    computeCapability.first, computeCapability.second);
-        }
-    } else if (computeCapability.first >= Toolkit2MaxCompute[0].major) {
-        // If runtime cuda version is NOT found in toolkit array
-        // use the top most toolkit max compute
-        int minorVersion = embeddedDevice ? tkitMaxCompute->embedded_minor
-                                          : tkitMaxCompute->minor;
-        if (computeCapability.second > minorVersion) {
-            computeCapability =
-                make_pair(Toolkit2MaxCompute[0].major, minorVersion);
+                    fromCudaVersion(rtCudaVer), computeCapability.first,
+                    computeCapability.second);
+        } else {
             spdlog::get("platform")
                 ->warn(
-                    "CUDA runtime version({}) not recognized. Targeting "
-                    "compute {}.{} for this device which is the latest compute "
-                    "capability supported by ArrayFire's CUDA runtime({}.{}). "
-                    "Please create an issue or a pull request on the ArrayFire "
-                    "repository to update the Toolkit2MaxCompute array with "
-                    "this version of the CUDA Runtime.",
-                    fromCudaVersion(rtCudaVer), originalCompute.first,
-                    originalCompute.second, computeCapability.first,
-                    computeCapability.second, computeCapability.first,
+                    "CUDA runtime version({}) not recognized. Using compute "
+                    "{}.{} for this device, the newest compatible NVRTC target "
+                    "known to ArrayFire. Please create an issue or a pull "
+                    "request to update the CUDA runtime target table.",
+                    fromCudaVersion(rtCudaVer), computeCapability.first,
                     computeCapability.second);
         }
-    } else if (computeCapability.first < 3) {
+    }
+
+    if (originalCompute.first < 3) {
         // all compute versions prior to Kepler, we don't support
         // don't change the computeCapability.
         spdlog::get("platform")
@@ -514,7 +561,7 @@ void DeviceManager::checkCudaVsDriverVersion() {
     debugRuntimeCheck(getLogger(), runtime, driver);
 
     int runtime_major = runtime / 1000;
-    int driver_major = driver / 1000;
+    int driver_major  = driver / 1000;
 
     if (runtime_major > driver_major) {
         string msg =
@@ -594,7 +641,8 @@ DeviceManager::DeviceManager()
         for (int i = 0; i < nDevices; i++) {
             cudaDevice_t dev{};
             CUDA_CHECK(cudaGetDeviceProperties(&dev.prop, i));
-            if (dev.prop.major < getMinSupportedCompute(cudaMajorVer)) {
+            if (make_pair(dev.prop.major, dev.prop.minor) <
+                getMinSupportedCompute(cudaMajorVer)) {
                 AF_TRACE("Unsuppored device: {}", dev.prop.name);
                 continue;
             } else {
@@ -627,6 +675,10 @@ DeviceManager::DeviceManager()
         }
     }
     nDevices = cuDevices.size();
+    if (nDevices == 0) {
+        AF_ERROR("No installed CUDA device is supported by this CUDA runtime.",
+                 AF_ERR_DRIVER);
+    }
 
     sortDevices();
 
@@ -638,13 +690,16 @@ DeviceManager::DeviceManager()
     for (int i = 0; i < nDevices; i++) {
         for (int j = 0; j < nDevices; j++) {
             if (i != j) {
+                const int nativeI = cuDevices[i].nativeId;
+                const int nativeJ = cuDevices[j].nativeId;
                 int can_access_peer;
-                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, i, j));
+                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, nativeI,
+                                                   nativeJ));
                 if (can_access_peer) {
-                    CUDA_CHECK(cudaSetDevice(i));
+                    CUDA_CHECK(cudaSetDevice(nativeI));
                     AF_TRACE("Peer access enabled for {}({}) and {}({})", i,
                              cuDevices[i].prop.name, j, cuDevices[j].prop.name);
-                    CUDA_CHECK(cudaDeviceEnablePeerAccess(j, 0));
+                    CUDA_CHECK(cudaDeviceEnablePeerAccess(nativeJ, 0));
                     device_peer_access_map[i][j] = true;
                 }
             } else {

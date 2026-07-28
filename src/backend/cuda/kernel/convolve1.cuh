@@ -11,18 +11,16 @@
 #include <math.hpp>
 #include <shared.hpp>
 
-__constant__ char cFilter[2 * (2 * (MAX_CONV1_FILTER_LEN - 1) + CONV_THREADS) *
-                          sizeof(double)];
-
 namespace arrayfire {
 namespace cuda {
 
 template<typename T, typename aT, bool expand>
-__global__ void convolve1(Param<T> out, CParam<T> signal, int fLen, int nBBS0,
-                          int nBBS1, int o1, int o2, int o3, int s1, int s2,
-                          int s3) {
+__global__ void convolve1(Param<T> out, CParam<T> signal, const aT *filter,
+                          int fLen, int nBBS0, int nBBS1, int o1, int o2,
+                          int o3, int s1, int s2, int s3) {
     SharedMemory<T> shared;
     T *shrdMem = shared.getPointer();
+    __shared__ aT impulse[MAX_CONV1_FILTER_LEN];
 
     const int padding = fLen - 1;
     const int shrdLen = blockDim.x + 2 * padding;
@@ -50,12 +48,15 @@ __global__ void convolve1(Param<T> out, CParam<T> signal, int fLen, int nBBS0,
          b3 * signal.strides[3] + /* activated with batched input signal */
          s3 * signal.strides[3]); /* activated with batched input filter */
 
-    const aT *impulse = (const aT *)cFilter;
-
     int gx = blockDim.x * (blockIdx.x - b1 * nBBS0);
 
     int s0 = signal.strides[0];
     int d0 = signal.dims[0];
+    // Keep the filter launch-local: module-global constant memory can be
+    // overwritten by another host thread between its copy and this launch.
+    for (int i = threadIdx.x; i < fLen; i += blockDim.x) {
+        impulse[i] = filter[i];
+    }
     for (int i = threadIdx.x; i < shrdLen; i += blockDim.x) {
         int idx    = gx - padding + i;
         shrdMem[i] = (idx >= 0 && idx < d0) ? src[idx * s0] : scalar<T>(0);

@@ -14,6 +14,7 @@
 #include <copy.hpp>
 #include <cublas.hpp>
 #include <cusolverDn.hpp>
+#include <debug_cuda.hpp>
 #include <err_cuda.hpp>
 #include <identity.hpp>
 #include <lu.hpp>
@@ -25,6 +26,26 @@
 
 namespace arrayfire {
 namespace cuda {
+
+namespace {
+
+template<typename T>
+__global__ void setBatchedSolvePointers(T **aPtrs, T **bPtrs, T *a, T *b,
+                                        const dim_t aStride2,
+                                        const dim_t aStride3,
+                                        const dim_t bStride2,
+                                        const dim_t bStride3, const int batchz,
+                                        const int batch) {
+    const int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= batch) { return; }
+
+    const int z = id % batchz;
+    const int w = id / batchz;
+    aPtrs[id]   = a + z * aStride2 + w * aStride3;
+    bPtrs[id]   = b + z * bStride2 + w * bStride3;
+}
+
+}  // namespace
 
 // cublasStatus_t cublas<>getrsBatched( cublasHandle_t handle,
 //                                      cublasOperation_t trans,
@@ -268,37 +289,23 @@ Array<T> generalSolveBatched(const Array<T> &a, const Array<T> &b) {
     int batchw = aDims[3];
     int batch  = batchz * batchw;
 
-    size_t bytes         = batch * sizeof(T *);
-    using unique_mem_ptr = std::unique_ptr<char, void (*)(void *)>;
+    size_t bytes             = batch * sizeof(T *);
+    auto aBatched_device_mem = memAlloc<char>(bytes);
+    auto bBatched_device_mem = memAlloc<char>(bytes);
 
-    unique_mem_ptr aBatched_host_mem(pinnedAlloc<char>(bytes),
-                                     pinnedFree);
-    unique_mem_ptr bBatched_host_mem(pinnedAlloc<char>(bytes),
-                                     pinnedFree);
+    T **aBatched_device_ptrs =
+        reinterpret_cast<T **>(aBatched_device_mem.get());
+    T **bBatched_device_ptrs =
+        reinterpret_cast<T **>(bBatched_device_mem.get());
 
-    T *a_ptr               = A.get();
-    T *b_ptr               = B.get();
-    T **aBatched_host_ptrs = (T **)aBatched_host_mem.get();
-    T **bBatched_host_ptrs = (T **)bBatched_host_mem.get();
-
-    for (int i = 0; i < batchw; i++) {
-        for (int j = 0; j < batchz; j++) {
-            aBatched_host_ptrs[i * batchz + j] =
-                a_ptr + j * A.strides()[2] + i * A.strides()[3];
-            bBatched_host_ptrs[i * batchz + j] =
-                b_ptr + j * B.strides()[2] + i * B.strides()[3];
-        }
-    }
-
-    unique_mem_ptr aBatched_device_mem(pinnedAlloc<char>(bytes), pinnedFree);
-    unique_mem_ptr bBatched_device_mem(pinnedAlloc<char>(bytes), pinnedFree);
-
-    T **aBatched_device_ptrs = (T **)aBatched_device_mem.get();
-    T **bBatched_device_ptrs = (T **)bBatched_device_mem.get();
-
-    CUDA_CHECK(cudaMemcpyAsync(aBatched_device_ptrs, aBatched_host_ptrs, bytes,
-                               cudaMemcpyHostToDevice,
-                               getStream(getActiveDeviceId())));
+    constexpr unsigned THREADS = 256;
+    const dim3 threads(THREADS);
+    const dim3 blocks((batch + THREADS - 1) / THREADS);
+    CUDA_LAUNCH((setBatchedSolvePointers<T>), blocks, threads,
+                aBatched_device_ptrs, bBatched_device_ptrs, A.get(), B.get(),
+                A.strides()[2], A.strides()[3], B.strides()[2], B.strides()[3],
+                batchz, batch);
+    POST_LAUNCH_CHECK();
 
     // Perform batched LU
     // getrf requires pivot and info to be device pointers
@@ -309,11 +316,8 @@ Array<T> generalSolveBatched(const Array<T> &a, const Array<T> &b) {
                                         A.strides()[1], pivots.get(),
                                         info.get(), batch));
 
-    CUDA_CHECK(cudaMemcpyAsync(bBatched_device_ptrs, bBatched_host_ptrs, bytes,
-                               cudaMemcpyHostToDevice,
-                               getStream(getActiveDeviceId())));
-
     // getrs requires info to be host pointer
+    using unique_mem_ptr = std::unique_ptr<char, void (*)(void *)>;
     unique_mem_ptr info_host_mem(pinnedAlloc<char>(batch * sizeof(int)),
                                  pinnedFree);
     CUBLAS_CHECK(getrsBatched_func<T>()(

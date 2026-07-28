@@ -176,7 +176,7 @@ void join(Array<T> &out, const int jdim, const vector<Array<T>> &inputs) {
                     if (1LL + jdim >= in->ndims() && in->isLinear()) {
                         CUDA_CHECK(cudaMemcpyAsync(outputIt->ptr, in->get(),
                                                    in->elements() * sizeof(T),
-                                                   cudaMemcpyHostToDevice,
+                                                   cudaMemcpyDeviceToDevice,
                                                    activeStream));
                     } else {
                         kernel::memcopy<T>(*outputIt, *in, in->ndims());
