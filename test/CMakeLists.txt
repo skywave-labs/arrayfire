@@ -11,6 +11,13 @@ set(AF_TEST_WITH_MTX_FILES
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules")
 
+add_test(
+  NAME cmake_cuda_architectures
+  COMMAND
+    ${CMAKE_COMMAND}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/select_compute_arch_test.cmake)
+set_tests_properties(cmake_cuda_architectures PROPERTIES LABELS "cmake;cuda")
+
 if(AF_CTEST_SEPARATED)
   include(GoogleTest)
 endif()
@@ -302,6 +309,17 @@ make_test(SRC constant.cpp)
 make_test(SRC convolve.cpp CXX11)
 make_test(SRC corrcoef.cpp)
 make_test(SRC covariance.cpp)
+if(AF_BUILD_CUDA)
+  if(AF_WITH_CUDNN)
+    set(cuda_shared_state_definitions AF_TEST_WITH_CUDNN)
+  endif()
+  make_test(
+    SRC cuda_shared_state.cpp
+    CXX11
+    SERIAL
+    BACKENDS "cuda"
+    DEFINITIONS ${cuda_shared_state_definitions})
+endif()
 make_test(SRC diagonal.cpp)
 make_test(SRC diff1.cpp)
 make_test(SRC diff2.cpp)

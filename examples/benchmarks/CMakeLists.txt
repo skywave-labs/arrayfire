@@ -30,6 +30,19 @@ if(ArrayFire_CUDA_FOUND)
   add_executable(blas_cuda blas.cpp)
   target_link_libraries(blas_cuda ArrayFire::afcuda)
 
+  if(NOT CUDA_FOUND)
+    find_package(CUDA QUIET)
+  endif()
+  if(CUDA_FOUND)
+    add_executable(cuda_backend_cuda cuda_backend.cpp)
+    target_include_directories(cuda_backend_cuda
+      SYSTEM PRIVATE
+        ${CUDA_INCLUDE_DIRS})
+    target_link_libraries(cuda_backend_cuda
+      ArrayFire::afcuda
+      ${CUDA_LIBRARIES})
+  endif()
+
   add_executable(cg_cuda cg.cpp)
   target_link_libraries(cg_cuda ArrayFire::afcuda)
 

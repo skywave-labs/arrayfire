@@ -10,18 +10,17 @@
 #include <Param.hpp>
 #include <math.hpp>
 
-__constant__ char cFilter[2 * (2 * (MAX_CONV1_FILTER_LEN - 1) + CONV_THREADS) *
-                          sizeof(double)];
-
 namespace arrayfire {
 namespace cuda {
 
 template<typename T, typename aT, bool expand, int fLen0, int fLen1>
-__global__ void convolve2(Param<T> out, CParam<T> signal, int nBBS0, int nBBS1,
-                          int o2, int o3, int s2, int s3) {
+__global__ void convolve2(Param<T> out, CParam<T> signal, const aT *filter,
+                          int nBBS0, int nBBS1, int o2, int o3, int s2,
+                          int s3) {
     const size_t C_SIZE = (CONV2_THREADS_X + 2 * (fLen0 - 1)) *
                           (CONV2_THREADS_Y + 2 * (fLen1 - 1));
     __shared__ T shrdMem[C_SIZE];
+    __shared__ aT impulse[fLen0 * fLen1];
 
     const int radius0  = fLen0 - 1;
     const int radius1  = fLen1 - 1;
@@ -45,8 +44,6 @@ __global__ void convolve2(Param<T> out, CParam<T> signal, int nBBS0, int nBBS1,
          b1 * signal.strides[3] + /* activated with batched input signal */
          s3 * signal.strides[3]); /* activated with batched input filter */
 
-    const aT *impulse = (const aT *)cFilter;
-
     int lx = threadIdx.x;
     int ly = threadIdx.y;
     int gx = CONV2_THREADS_X * (blockIdx.x - b0 * nBBS0) + lx;
@@ -56,10 +53,17 @@ __global__ void convolve2(Param<T> out, CParam<T> signal, int nBBS0, int nBBS1,
 
     if (b1 >= out.dims[3]) return;
 
-    int s0 = signal.strides[0];
-    int s1 = signal.strides[1];
-    int d0 = signal.dims[0];
-    int d1 = signal.dims[1];
+    int s0             = signal.strides[0];
+    int s1             = signal.strides[1];
+    int d0             = signal.dims[0];
+    int d1             = signal.dims[1];
+    const int threadId = ly * blockDim.x + lx;
+    const int nThreads = blockDim.x * blockDim.y;
+    // Stage this launch's filter once per block instead of mutating a
+    // module-global constant buffer shared by concurrent host calls.
+    for (int i = threadId; i < fLen0 * fLen1; i += nThreads) {
+        impulse[i] = filter[i];
+    }
     // below loops are traditional loops, they only run multiple
     // times filter length is more than launch size
 #pragma unroll

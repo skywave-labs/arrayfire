@@ -36,16 +36,10 @@ void transform(Param<T> out, CParam<T> in, CParam<float> tf, const bool inverse,
         TemplateArgs(TemplateTypename<T>(), TemplateArg(inverse),
                      TemplateArg(order)));
 
-    const unsigned int nImg2  = in.dims[2];
-    const unsigned int nImg3  = in.dims[3];
-    const unsigned int nTfs2  = tf.dims[2];
-    const unsigned int nTfs3  = tf.dims[3];
-    const unsigned int tf_len = (perspective) ? 9 : 6;
-
-    // Copy transform to constant memory.
-    auto constPtr = transform.getDevPtr("c_tmat");
-    transform.copyToReadOnly(constPtr, reinterpret_cast<CUdeviceptr>(tf.ptr),
-                             nTfs2 * nTfs3 * tf_len * sizeof(float));
+    const unsigned int nImg2 = in.dims[2];
+    const unsigned int nImg3 = in.dims[3];
+    const unsigned int nTfs2 = tf.dims[2];
+    const unsigned int nTfs3 = tf.dims[3];
 
     dim3 threads(TX, TY, 1);
     dim3 blocks(divup(out.dims[0], threads.x), divup(out.dims[1], threads.y));
@@ -67,7 +61,7 @@ void transform(Param<T> out, CParam<T> in, CParam<float> tf, const bool inverse,
 
     EnqueueArgs qArgs(blocks, threads, getActiveStream());
 
-    transform(qArgs, out, in, nImg2, nImg3, nTfs2, nTfs3, batchImg2,
+    transform(qArgs, out, in, tf.ptr, nImg2, nImg3, nTfs2, nTfs3, batchImg2,
               blocksXPerImage, blocksYPerImage, perspective, method);
 
     POST_LAUNCH_CHECK();

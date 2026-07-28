@@ -11,11 +11,6 @@
 #include <math.hpp>
 #include <af/defines.h>
 
-/// doAnotherLaunch is a variable in kernel space
-/// used to track the convergence of
-/// the breath first search algorithm
-__device__ int doAnotherLaunch = 0;
-
 namespace arrayfire {
 namespace cuda {
 
@@ -53,8 +48,8 @@ __global__ void initSeeds(Param<T> out, CParam<uint> seedsx,
 }
 
 template<typename T>
-__global__ void floodStep(Param<T> out, CParam<T> img, T lowValue,
-                          T highValue) {
+__global__ void floodStep(Param<T> out, CParam<T> img, T lowValue, T highValue,
+                          int *doAnotherLaunch) {
     constexpr int RADIUS      = 1;
     constexpr int SMEM_WIDTH  = THREADS_X + 2 * RADIUS;
     constexpr int SMEM_HEIGHT = THREADS_Y + 2 * RADIUS;
@@ -125,7 +120,7 @@ __global__ void floodStep(Param<T> out, CParam<T> img, T lowValue,
         // Atleast one border pixel changed. Therefore, mark for
         // another kernel launch to propogate changes beyond border
         // of this block
-        doAnotherLaunch = 1;
+        atomicExch(doAnotherLaunch, 1);
     }
 
     if (gx < d0 && gy < d1) { optr[(gx * s0 + gy * s1)] = smem[j][i]; }

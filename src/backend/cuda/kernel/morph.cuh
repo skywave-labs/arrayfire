@@ -12,14 +12,6 @@
 #include <math.hpp>
 #include <shared.hpp>
 
-// cFilter is used by both 2d morph and 3d morph
-// Maximum kernel size supported for 2d morph is 19x19*8 = 2888
-// Maximum kernel size supported for 3d morph is 7x7x7*8 = 2744
-// We will declare a char array as __constant__ array and allocate
-// size necessary to hold doubles of FILTER_LEN*FILTER_LEN
-__constant__ char
-    cFilter[MAX_MORPH_FILTER_LEN * MAX_MORPH_FILTER_LEN * sizeof(double)];
-
 namespace arrayfire {
 namespace cuda {
 
@@ -55,12 +47,16 @@ inline __device__ void load2ShrdMem(T* shrd, const T* const in, int lx, int ly,
 //  * windLen
 // If SeLength is > 0, then that will override the kernel argument.
 template<typename T, bool isDilation, int SeLength = 0>
-__global__ void morph(Param<T> out, CParam<T> in, int nBBS0, int nBBS1,
-                      int windLen = 0) {
+__global__ void morph(Param<T> out, CParam<T> in, const T* filter, int nBBS0,
+                      int nBBS1, int windLen = 0) {
     windLen = (SeLength > 0 ? SeLength : windLen);
 
     SharedMemory<T> shared;
     T* shrdMem = shared.getPointer();
+    constexpr int FILTER_ELEMENTS =
+        SeLength > 0 ? SeLength * SeLength
+                     : MAX_MORPH_FILTER_LEN * MAX_MORPH_FILTER_LEN;
+    __shared__ T d_filt[FILTER_ELEMENTS];
 
     // calculate necessary offset and window parameters
     const int halo = windLen / 2;
@@ -83,6 +79,14 @@ __global__ void morph(Param<T> out, CParam<T> in, int nBBS0, int nBBS1,
     const int gx = blockDim.x * (blockIdx.x - b2 * nBBS0) + lx;
     const int gy = blockDim.y * (blockIdx.y - b3 * nBBS1) + ly;
 
+    const int threadId = ly * blockDim.x + lx;
+    const int nThreads = blockDim.x * blockDim.y;
+    // Each launch supplies its own mask; shared memory keeps the inner loop
+    // fast without a mutable module-global constant buffer.
+    for (int idx = threadId; idx < windLen * windLen; idx += nThreads) {
+        d_filt[idx] = filter[idx];
+    }
+
     // pull image to local memory
     for (int b = ly, gy2 = gy; b < shrdLen1;
          b += blockDim.y, gy2 += blockDim.y) {
@@ -100,9 +104,8 @@ __global__ void morph(Param<T> out, CParam<T> in, int nBBS0, int nBBS1,
 
     __syncthreads();
 
-    const T* d_filt = (const T*)cFilter;
-    T acc           = isDilation ? common::Binary<T, af_max_t>::init()
-                                 : common::Binary<T, af_min_t>::init();
+    T acc = isDilation ? common::Binary<T, af_max_t>::init()
+                       : common::Binary<T, af_min_t>::init();
 #pragma unroll
     for (int wj = 0; wj < windLen; ++wj) {
         int joff   = wj * windLen;
@@ -148,9 +151,10 @@ inline __device__ void load2ShrdVolume(T* shrd, const T* const in, int lx,
 // kernel assumes mask/filter is square and hence does the
 // necessary operations accordingly.
 template<typename T, bool isDilation, int windLen>
-__global__ void morph3D(Param<T> out, CParam<T> in, int nBBS) {
+__global__ void morph3D(Param<T> out, CParam<T> in, const T* filter, int nBBS) {
     SharedMemory<T> shared;
     T* shrdMem = shared.getPointer();
+    __shared__ T d_filt[windLen * windLen * windLen];
 
     const int halo = windLen / 2;
     const int padding =
@@ -176,6 +180,15 @@ __global__ void morph3D(Param<T> out, CParam<T> in, int nBBS) {
     const int gy = blockDim.y * blockIdx.y + ly;
     const int gz = blockDim.z * blockIdx.z + lz;
 
+    const int threadId = (lz * blockDim.y + ly) * blockDim.x + threadIdx.x;
+    const int nThreads = blockDim.x * blockDim.y * blockDim.z;
+    // Each launch supplies its own mask; shared memory keeps the inner loop
+    // fast without a mutable module-global constant buffer.
+    for (int idx = threadId; idx < windLen * windLen * windLen;
+         idx += nThreads) {
+        d_filt[idx] = filter[idx];
+    }
+
     for (int c = lz, gz2 = gz; c < shrdLen2;
          c += blockDim.z, gz2 += blockDim.z) {
         for (int b = ly, gy2 = gy; b < shrdLen1;
@@ -196,9 +209,8 @@ __global__ void morph3D(Param<T> out, CParam<T> in, int nBBS) {
     int j = ly + halo;
     int k = lz + halo;
 
-    const T* d_filt = (const T*)cFilter;
-    T acc           = isDilation ? common::Binary<T, af_max_t>::init()
-                                 : common::Binary<T, af_min_t>::init();
+    T acc = isDilation ? common::Binary<T, af_max_t>::init()
+                       : common::Binary<T, af_min_t>::init();
 #pragma unroll
     for (int wk = 0; wk < windLen; ++wk) {
         int koff   = wk * se_area;

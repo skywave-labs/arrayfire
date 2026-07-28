@@ -37,18 +37,15 @@ cusparseOperation_t toCusparseTranspose(af_mat_prop opt) {
 }
 
 #if CUSPARSE_VERSION < 11300
-#define AF_CUSPARSE_SPMV_CSR_ALG1 CUSPARSE_CSRMV_ALG1
-#define AF_CUSPARSE_SPMV_ALG_DEFAULT CUSPARSE_MV_ALG_DEFAULT
+#define AF_CUSPARSE_SPMV_ALG CUSPARSE_MV_ALG_DEFAULT
 #define AF_CUSPARSE_SPMM_CSR_ALG1 CUSPARSE_CSRMM_ALG1
 #define AF_CUSPARSE_SPMM_CSR_ALG1 CUSPARSE_CSRMM_ALG1
 #elif CUSPARSE_VERSION < 11400
-#define AF_CUSPARSE_SPMV_CSR_ALG1 CUSPARSE_CSRMV_ALG1
-#define AF_CUSPARSE_SPMV_ALG_DEFAULT CUSPARSE_MV_ALG_DEFAULT
+#define AF_CUSPARSE_SPMV_ALG CUSPARSE_MV_ALG_DEFAULT
 #define AF_CUSPARSE_SPMM_CSR_ALG1 CUSPARSE_SPMM_CSR_ALG1
 #define AF_CUSPARSE_SPMM_CSR_ALG1 CUSPARSE_SPMM_CSR_ALG1
 #else
-#define AF_CUSPARSE_SPMV_CSR_ALG1 CUSPARSE_SPMV_CSR_ALG1
-#define AF_CUSPARSE_SPMV_ALG_DEFAULT CUSPARSE_SPMV_ALG_DEFAULT
+#define AF_CUSPARSE_SPMV_ALG CUSPARSE_SPMV_ALG_DEFAULT
 #define AF_CUSPARSE_SPMM_CSR_ALG1 CUSPARSE_SPMM_CSR_ALG1
 #define AF_CUSPARSE_SPMM_CSR_ALG1 CUSPARSE_SPMM_CSR_ALG1
 #endif
@@ -64,7 +61,7 @@ size_t spmvBufferSize(cusparseOperation_t opA, const T *alpha,
     cusparseModule &_ = getCusparsePlugin();
     CUSPARSE_CHECK(_.cusparseSpMV_bufferSize(
         sparseHandle(), opA, alpha, matA, vecX, beta, vecY, getComputeType<T>(),
-        AF_CUSPARSE_SPMV_CSR_ALG1, &retVal));
+        AF_CUSPARSE_SPMV_ALG, &retVal));
     return retVal;
 }
 
@@ -75,7 +72,7 @@ void spmv(cusparseOperation_t opA, const T *alpha,
     cusparseModule &_ = getCusparsePlugin();
     CUSPARSE_CHECK(_.cusparseSpMV(sparseHandle(), opA, alpha, matA, vecX, beta,
                                   vecY, getComputeType<T>(),
-                                  AF_CUSPARSE_SPMV_ALG_DEFAULT, buffer));
+                                  AF_CUSPARSE_SPMV_ALG, buffer));
 }
 
 template<typename T>

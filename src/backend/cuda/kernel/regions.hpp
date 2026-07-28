@@ -27,11 +27,6 @@
 static const int THREADS_X = 16;
 static const int THREADS_Y = 16;
 
-// This flag is used to track convergence (i.e. it is set, whenever
-// any label equivalency changes.  When no labels changed, the
-// algorithm is finished and the kernel ends.
-__device__ static int continue_flag = 1;
-
 // Wrapper function for texture fetch
 template<typename T>
 static inline __device__ T fetch(const int n,
@@ -123,7 +118,8 @@ struct warp_count {
 // int n_per_thread = 2; // 2x2 per thread = 4 total elems per thread
 template<typename T, int block_dim, int n_per_thread, bool full_conn>
 __global__ static void update_equiv(arrayfire::cuda::Param<T> equiv_map,
-                                    const cudaTextureObject_t tex) {
+                                    const cudaTextureObject_t tex,
+                                    int* continue_flag) {
     // Basic coordinates
     const int base_x = (blockIdx.x * blockDim.x * n_per_thread) + threadIdx.x;
     const int base_y = (blockIdx.y * blockDim.y * n_per_thread) + threadIdx.y;
@@ -323,6 +319,8 @@ __global__ static void update_equiv(arrayfire::cuda::Param<T> equiv_map,
         }
     }  // while (continue_iter)
 
+    bool block_changed = false;
+
 // Write out equiv_map
 #pragma unroll
     for (int xb = 0; xb < n_per_thread; ++xb) {
@@ -334,9 +332,14 @@ __global__ static void update_equiv(arrayfire::cuda::Param<T> equiv_map,
             const int tid_i = xb * n_per_thread + yb;
             if (x < width && y < height && write[tid_i]) {
                 equiv_map.ptr[n] = best_label[tid_i];
-                continue_flag    = 1;
+                block_changed    = true;
             }
         }
+    }
+
+    if (__syncthreads_or(block_changed) && threadIdx.x == 0 &&
+        threadIdx.y == 0) {
+        atomicExch(continue_flag, 1);
     }
 }
 
@@ -358,6 +361,8 @@ void regions(arrayfire::cuda::Param<T> out, arrayfire::cuda::CParam<char> in,
 
     dim3 blocks(blk_x, blk_y);
 
+    auto continue_flag = arrayfire::cuda::memAlloc<int>(1);
+
     CUDA_LAUNCH((initial_label<T, n_per_thread>), blocks, threads, out, in);
 
     POST_LAUNCH_CHECK();
@@ -366,18 +371,17 @@ void regions(arrayfire::cuda::Param<T> out, arrayfire::cuda::CParam<char> in,
 
     while (h_continue) {
         h_continue = 0;
-        CUDA_CHECK(
-            cudaMemcpyToSymbolAsync(continue_flag, &h_continue, sizeof(int), 0,
-                                    cudaMemcpyHostToDevice, getActiveStream()));
+        CUDA_CHECK(cudaMemsetAsync(continue_flag.get(), 0, sizeof(int),
+                                   getActiveStream()));
 
         CUDA_LAUNCH((update_equiv<T, 16, n_per_thread, full_conn>), blocks,
-                    threads, out, tex);
+                    threads, out, tex, continue_flag.get());
 
         POST_LAUNCH_CHECK();
 
-        CUDA_CHECK(cudaMemcpyFromSymbolAsync(
-            &h_continue, continue_flag, sizeof(int), 0, cudaMemcpyDeviceToHost,
-            getActiveStream()));
+        CUDA_CHECK(cudaMemcpyAsync(&h_continue, continue_flag.get(),
+                                   sizeof(int), cudaMemcpyDeviceToHost,
+                                   getActiveStream()));
         CUDA_CHECK(cudaStreamSynchronize(getActiveStream()));
     }
 

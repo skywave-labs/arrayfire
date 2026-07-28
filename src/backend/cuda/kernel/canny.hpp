@@ -11,6 +11,7 @@
 #include <common/dispatch.hpp>
 #include <common/kernel_cache.hpp>
 #include <debug_cuda.hpp>
+#include <memory.hpp>
 #include <nvrtc_kernel_headers/canny_cuh.hpp>
 
 namespace arrayfire {
@@ -75,18 +76,21 @@ void edgeTrackingHysteresis(Param<T> output, CParam<T> strong, CParam<T> weak) {
     dim3 blocks(blk_x * weak.dims[2], blk_y * weak.dims[3]);
 
     EnqueueArgs qArgs(blocks, threads, getActiveStream());
+    auto hasChanged = memAlloc<int>(1);
+
     initEdgeOut(qArgs, output, strong, weak, blk_x, blk_y);
     POST_LAUNCH_CHECK();
-
-    auto flagPtr = edgeTrack.getDevPtr("hasChanged");
 
     int notFinished = 1;
     while (notFinished) {
         notFinished = 0;
-        edgeTrack.setFlag(flagPtr, &notFinished);
-        edgeTrack(qArgs, output, blk_x, blk_y);
+        CUDA_CHECK(cudaMemsetAsync(hasChanged.get(), 0, sizeof(int),
+                                   getActiveStream()));
+        edgeTrack(qArgs, output, hasChanged.get(), blk_x, blk_y);
         POST_LAUNCH_CHECK();
-        notFinished = edgeTrack.getFlag(flagPtr);
+        CUDA_CHECK(cudaMemcpyAsync(&notFinished, hasChanged.get(), sizeof(int),
+                                   cudaMemcpyDeviceToHost, getActiveStream()));
+        CUDA_CHECK(cudaStreamSynchronize(getActiveStream()));
     }
     suppressLeftOver(qArgs, output, blk_x, blk_y);
     POST_LAUNCH_CHECK();
