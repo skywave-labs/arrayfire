@@ -319,6 +319,12 @@ if(AF_BUILD_CUDA)
     SERIAL
     BACKENDS "cuda"
     DEFINITIONS ${cuda_shared_state_definitions})
+  target_include_directories(
+    test_cuda_shared_state_cuda
+    PRIVATE ${ArrayFire_SOURCE_DIR}/src/backend)
+  set_target_properties(
+    test_cuda_shared_state_cuda
+    PROPERTIES CXX_STANDARD 14)
 endif()
 make_test(SRC diagonal.cpp)
 make_test(SRC diff1.cpp)

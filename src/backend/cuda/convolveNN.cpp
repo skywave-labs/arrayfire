@@ -18,6 +18,8 @@
 #include <common/unique_handle.hpp>
 #ifdef WITH_CUDNN
 #include <cudnn.hpp>
+#include <cudnn_algorithm_cache.hpp>
+#include <device_manager.hpp>
 #endif
 #include <err_cuda.hpp>
 #include <kernel/convolve.hpp>
@@ -61,47 +63,105 @@ template<typename T>
 using scale_type =
     typename conditional<is_same<T, double>::value, double, float>::type;
 
+namespace {
+
+constexpr size_t kCudnnAlgorithmCacheCapacity = 128;
+
+using ForwardAlgorithm      = pair<cudnnConvolutionFwdAlgo_t, size_t>;
+using ForwardAlgorithmCache = detail::CudnnAlgorithmCache<
+    detail::CudnnConvolutionAlgorithmKey, ForwardAlgorithm,
+    detail::CudnnConvolutionAlgorithmKeyHash, kCudnnAlgorithmCacheCapacity>;
+
+using BackwardFilterAlgorithm = pair<cudnnConvolutionBwdFilterAlgo_t, size_t>;
+using BackwardFilterAlgorithmCache = detail::CudnnAlgorithmCache<
+    detail::CudnnConvolutionAlgorithmKey, BackwardFilterAlgorithm,
+    detail::CudnnConvolutionAlgorithmKeyHash, kCudnnAlgorithmCacheCapacity>;
+
+ForwardAlgorithmCache &forwardAlgorithmCache() {
+    static auto *caches = new ForwardAlgorithmCache[DeviceManager::MAX_DEVICES];
+    return caches[getActiveDeviceId()];
+}
+
+BackwardFilterAlgorithmCache &backwardFilterAlgorithmCache() {
+    static auto *caches =
+        new BackwardFilterAlgorithmCache[DeviceManager::MAX_DEVICES];
+    return caches[getActiveDeviceId()];
+}
+
+}  // namespace
+
 pair<cudnnConvolutionFwdAlgo_t, size_t> getForwardAlgorithm(
     cudnnHandle_t cudnn, cudnnTensorDescriptor_t input_descriptor,
     cudnnFilterDescriptor_t filter_descriptor,
     cudnnConvolutionDescriptor_t convolution_descriptor,
-    cudnnTensorDescriptor_t output_descriptor) {
-    cudnnConvolutionFwdAlgo_t convolution_algorithm;
-    size_t workspace_bytes = 0;
+    cudnnTensorDescriptor_t output_descriptor,
+    const detail::CudnnConvolutionAlgorithmKey &key, bool *cacheHit) {
+    const auto result = forwardAlgorithmCache().getOrCreate(key, [&]() {
+        AF_TRACE(
+            "cuDNN forward algorithm cache miss on device {}: "
+            "input={}x{}x{}x{}, filter={}x{}x{}x{}",
+            getActiveDeviceId(), key.input[0], key.input[1], key.input[2],
+            key.input[3], key.filter[0], key.filter[1], key.filter[2],
+            key.filter[3]);
+        cudnnConvolutionFwdAlgo_t convolution_algorithm =
+            CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+        size_t workspace_bytes = 0;
 
-    auto version = getCudnnPlugin().getVersion();
-    if (version.major() >= 8) {
-        int maxAlgoCount = 0;
-        CUDNN_CHECK(cuda::cudnnGetConvolutionForwardAlgorithmMaxCount(
-            cudnn, &maxAlgoCount));
-
-        vector<cudnnConvolutionFwdAlgoPerf_t> perfResults(maxAlgoCount);
-        int returnAlgoCount = 0;
-        CUDNN_CHECK(cuda::cudnnFindConvolutionForwardAlgorithm(
-            cudnn, input_descriptor, filter_descriptor, convolution_descriptor,
-            output_descriptor, maxAlgoCount, &returnAlgoCount,
-            perfResults.data()));
-
-        for (int i = 0; i < returnAlgoCount; ++i) {
-            if (perfResults[i].status == CUDNN_STATUS_SUCCESS) {
-                convolution_algorithm = perfResults[i].algo;
-                workspace_bytes       = perfResults[i].memory;
-                break;
+        auto version = getCudnnPlugin().getVersion();
+        if (version.major() >= 8) {
+            int maxAlgoCount = 0;
+            CUDNN_CHECK(cuda::cudnnGetConvolutionForwardAlgorithmMaxCount(
+                cudnn, &maxAlgoCount));
+            if (maxAlgoCount <= 0) {
+                AF_ERROR("cuDNN returned no forward convolution algorithms",
+                         AF_ERR_NOT_SUPPORTED);
             }
+
+            vector<cudnnConvolutionFwdAlgoPerf_t> perfResults(maxAlgoCount);
+            int returnAlgoCount = 0;
+            CUDNN_CHECK(cuda::cudnnFindConvolutionForwardAlgorithm(
+                cudnn, input_descriptor, filter_descriptor,
+                convolution_descriptor, output_descriptor, maxAlgoCount,
+                &returnAlgoCount, perfResults.data()));
+            if (returnAlgoCount < 0 || returnAlgoCount > maxAlgoCount) {
+                AF_ERROR("cuDNN returned an invalid forward algorithm count",
+                         AF_ERR_INTERNAL);
+            }
+
+            bool found = false;
+            for (int i = 0; i < returnAlgoCount; ++i) {
+                if (perfResults[i].status == CUDNN_STATUS_SUCCESS) {
+                    convolution_algorithm = perfResults[i].algo;
+                    found                 = true;
+                    break;
+                }
+            }
+            if (!found) {
+                AF_ERROR("cuDNN found no usable forward convolution algorithm",
+                         AF_ERR_NOT_SUPPORTED);
+            }
+        } else {
+            const int memory_limit =
+                0;  // TODO: set to remaining space in memory manager?
+            CUDNN_CHECK(cuda::cudnnGetConvolutionForwardAlgorithm(
+                cudnn, input_descriptor, filter_descriptor,
+                convolution_descriptor, output_descriptor,
+                CUDNN_CONVOLUTION_FWD_PREFER_FASTEST, memory_limit,
+                &convolution_algorithm));
         }
-    } else {
-        const int memory_limit =
-            0;  // TODO: set to remaining space in memory manager?
-        CUDNN_CHECK(cuda::cudnnGetConvolutionForwardAlgorithm(
-            cudnn, input_descriptor, filter_descriptor, convolution_descriptor,
-            output_descriptor, CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
-            memory_limit, &convolution_algorithm));
+
+        // Find results also report a math type, but ArrayFire currently
+        // executes with the descriptor's default math policy. Query the
+        // workspace for the descriptor that will actually be used instead of
+        // caching perf.memory.
         CUDNN_CHECK(cuda::cudnnGetConvolutionForwardWorkspaceSize(
             cudnn, input_descriptor, filter_descriptor, convolution_descriptor,
             output_descriptor, convolution_algorithm, &workspace_bytes));
-    }
 
-    return {convolution_algorithm, workspace_bytes};
+        return ForwardAlgorithm{convolution_algorithm, workspace_bytes};
+    });
+    *cacheHit         = result.lookup != ForwardAlgorithmCache::Lookup::Miss;
+    return result.value;
 }
 
 template<typename T>
@@ -139,25 +199,44 @@ Array<T> convolve2_cudnn(const Array<T> &signal, const Array<T> &filter,
     Array<T> out = createEmptyArray<T>(odims);
 
     auto output_descriptor = toCudnn<cudnnTensorDescriptor_t>(out);
+    const auto algorithm_key = detail::makeCudnnConvolutionAlgorithmKey(
+        signal.dims(), filter.dims(), odims, stride, padding, dilation,
+        static_cast<int>(cudnn_dtype));
 
     // get convolution algorithm
     cudnnConvolutionFwdAlgo_t convolution_algorithm;
     size_t workspace_bytes = 0;
+    bool cache_hit         = false;
 
-    tie(convolution_algorithm, workspace_bytes) =
-        getForwardAlgorithm(cudnn, input_descriptor, filter_descriptor,
-                            convolution_descriptor, output_descriptor);
-
-    auto workspace_buffer = memAlloc<char>(workspace_bytes);
+    tie(convolution_algorithm, workspace_bytes) = getForwardAlgorithm(
+        cudnn, input_descriptor, filter_descriptor, convolution_descriptor,
+        output_descriptor, algorithm_key, &cache_hit);
 
     // perform convolution
     auto alpha = scalar<scale_type<T>>(1.0);
     auto beta  = scalar<scale_type<T>>(0.0);
-    CUDNN_CHECK(cuda::cudnnConvolutionForward(
-        cudnn, &alpha, input_descriptor, signal.device(), filter_descriptor,
-        filter.device(), convolution_descriptor, convolution_algorithm,
-        (void *)workspace_buffer.get(), workspace_bytes, &beta,
-        output_descriptor, out.device()));
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        try {
+            auto workspace_buffer = memAlloc<char>(workspace_bytes);
+            CUDNN_CHECK(cuda::cudnnConvolutionForward(
+                cudnn, &alpha, input_descriptor, signal.device(),
+                filter_descriptor, filter.device(), convolution_descriptor,
+                convolution_algorithm, (void *)workspace_buffer.get(),
+                workspace_bytes, &beta, output_descriptor, out.device()));
+            return out;
+        } catch (const AfError &error) {
+            forwardAlgorithmCache().erase(algorithm_key);
+            if (!cache_hit || attempt != 0 ||
+                error.getError() != AF_ERR_NO_MEM) {
+                throw;
+            }
+
+            tie(convolution_algorithm, workspace_bytes) =
+                getForwardAlgorithm(cudnn, input_descriptor, filter_descriptor,
+                                    convolution_descriptor, output_descriptor,
+                                    algorithm_key, &cache_hit);
+        }
+    }
 
     return out;
 }
@@ -412,41 +491,75 @@ pair<cudnnConvolutionBwdFilterAlgo_t, size_t> getBackwardFilterAlgorithm(
     cudnnHandle_t cudnn, cudnnTensorDescriptor_t x_descriptor,
     cudnnTensorDescriptor_t dy_descriptor,
     cudnnConvolutionDescriptor_t convolution_descriptor,
-    cudnnFilterDescriptor_t dw_descriptor) {
-    // determine algorithm to use
-    cudnnConvolutionBwdFilterAlgo_t bwd_filt_convolution_algorithm;
-    // figure out scratch space memory requirements
-    size_t workspace_bytes = 0;
+    cudnnFilterDescriptor_t dw_descriptor,
+    const detail::CudnnConvolutionAlgorithmKey &key, bool *cacheHit) {
+    const auto result = backwardFilterAlgorithmCache().getOrCreate(key, [&]() {
+        AF_TRACE(
+            "cuDNN backward-filter algorithm cache miss on device {}: "
+            "input={}x{}x{}x{}, filter={}x{}x{}x{}",
+            getActiveDeviceId(), key.input[0], key.input[1], key.input[2],
+            key.input[3], key.filter[0], key.filter[1], key.filter[2],
+            key.filter[3]);
+        cudnnConvolutionBwdFilterAlgo_t bwd_filt_convolution_algorithm =
+            CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0;
+        size_t workspace_bytes = 0;
 
-    auto version = getCudnnPlugin().getVersion();
-    if (version.major() >= 8) {
-        int maxAlgoCount = 0;
-        CUDNN_CHECK(cuda::cudnnGetConvolutionBackwardFilterAlgorithmMaxCount(
-            cudnn, &maxAlgoCount));
-
-        vector<cudnnConvolutionBwdFilterAlgoPerf_t> perfResults(maxAlgoCount);
-        int returnAlgoCount = 0;
-        CUDNN_CHECK(cuda::cudnnFindConvolutionBackwardFilterAlgorithm(
-            cudnn, x_descriptor, dy_descriptor, convolution_descriptor,
-            dw_descriptor, maxAlgoCount, &returnAlgoCount, perfResults.data()));
-
-        for (int i = 0; i < returnAlgoCount; ++i) {
-            if (perfResults[i].status == CUDNN_STATUS_SUCCESS) {
-                bwd_filt_convolution_algorithm = perfResults[i].algo;
-                workspace_bytes                = perfResults[i].memory;
-                break;
+        auto version = getCudnnPlugin().getVersion();
+        if (version.major() >= 8) {
+            int maxAlgoCount = 0;
+            CUDNN_CHECK(
+                cuda::cudnnGetConvolutionBackwardFilterAlgorithmMaxCount(
+                    cudnn, &maxAlgoCount));
+            if (maxAlgoCount <= 0) {
+                AF_ERROR(
+                    "cuDNN returned no backward-filter convolution algorithms",
+                    AF_ERR_NOT_SUPPORTED);
             }
+
+            vector<cudnnConvolutionBwdFilterAlgoPerf_t> perfResults(
+                maxAlgoCount);
+            int returnAlgoCount = 0;
+            CUDNN_CHECK(cuda::cudnnFindConvolutionBackwardFilterAlgorithm(
+                cudnn, x_descriptor, dy_descriptor, convolution_descriptor,
+                dw_descriptor, maxAlgoCount, &returnAlgoCount,
+                perfResults.data()));
+            if (returnAlgoCount < 0 || returnAlgoCount > maxAlgoCount) {
+                AF_ERROR(
+                    "cuDNN returned an invalid backward-filter algorithm "
+                    "count",
+                    AF_ERR_INTERNAL);
+            }
+
+            bool found = false;
+            for (int i = 0; i < returnAlgoCount; ++i) {
+                if (perfResults[i].status == CUDNN_STATUS_SUCCESS) {
+                    bwd_filt_convolution_algorithm = perfResults[i].algo;
+                    found                          = true;
+                    break;
+                }
+            }
+            if (!found) {
+                AF_ERROR(
+                    "cuDNN found no usable backward-filter convolution "
+                    "algorithm",
+                    AF_ERR_NOT_SUPPORTED);
+            }
+        } else {
+            CUDNN_CHECK(cuda::cudnnGetConvolutionBackwardFilterAlgorithm(
+                cudnn, x_descriptor, dy_descriptor, convolution_descriptor,
+                dw_descriptor, CUDNN_CONVOLUTION_BWD_FILTER_PREFER_FASTEST, 0,
+                &bwd_filt_convolution_algorithm));
         }
-    } else {
-        CUDNN_CHECK(cuda::cudnnGetConvolutionBackwardFilterAlgorithm(
-            cudnn, x_descriptor, dy_descriptor, convolution_descriptor,
-            dw_descriptor, CUDNN_CONVOLUTION_BWD_FILTER_PREFER_FASTEST, 0,
-            &bwd_filt_convolution_algorithm));
+
         CUDNN_CHECK(cuda::cudnnGetConvolutionBackwardFilterWorkspaceSize(
             cudnn, x_descriptor, dy_descriptor, convolution_descriptor,
             dw_descriptor, bwd_filt_convolution_algorithm, &workspace_bytes));
-    }
-    return {bwd_filt_convolution_algorithm, workspace_bytes};
+
+        return BackwardFilterAlgorithm{bwd_filt_convolution_algorithm,
+                                       workspace_bytes};
+    });
+    *cacheHit = result.lookup != BackwardFilterAlgorithmCache::Lookup::Miss;
+    return result.value;
 }
 
 template<typename T>
@@ -475,28 +588,51 @@ Array<T> filter_gradient_cudnn(const Array<T> &incoming_gradient,
 
     // create output filter gradient descriptor
     auto dw_descriptor = toCudnn<cudnnFilterDescriptor_t>(original_filter);
+    const auto algorithm_key = detail::makeCudnnConvolutionAlgorithmKey(
+        original_signal.dims(), original_filter.dims(),
+        incoming_gradient.dims(), stride, padding, dilation,
+        static_cast<int>(cudnn_dtype));
 
     // determine algorithm to use
     cudnnConvolutionBwdFilterAlgo_t bwd_filt_convolution_algorithm;
     // figure out scratch space memory requirements
     size_t workspace_bytes = 0;
+    bool cache_hit         = false;
 
     tie(bwd_filt_convolution_algorithm, workspace_bytes) =
         getBackwardFilterAlgorithm(cudnn, x_descriptor, dy_descriptor,
-                                   convolution_descriptor, dw_descriptor);
+                                   convolution_descriptor, dw_descriptor,
+                                   algorithm_key, &cache_hit);
 
     // prepare output array and scratch space
-    Array<T> out          = createEmptyArray<T>(fDims);
-    auto workspace_buffer = memAlloc<char>(workspace_bytes);
+    Array<T> out = createEmptyArray<T>(fDims);
 
     // perform convolution
     auto alpha = scalar<scale_type<T>>(1.0);
     auto beta  = scalar<scale_type<T>>(0.0);
-    CUDNN_CHECK(cuda::cudnnConvolutionBackwardFilter(
-        cudnn, &alpha, x_descriptor, original_signal.device(), dy_descriptor,
-        incoming_gradient.device(), convolution_descriptor,
-        bwd_filt_convolution_algorithm, (void *)workspace_buffer.get(),
-        workspace_bytes, &beta, dw_descriptor, out.device()));
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        try {
+            auto workspace_buffer = memAlloc<char>(workspace_bytes);
+            CUDNN_CHECK(cuda::cudnnConvolutionBackwardFilter(
+                cudnn, &alpha, x_descriptor, original_signal.device(),
+                dy_descriptor, incoming_gradient.device(),
+                convolution_descriptor, bwd_filt_convolution_algorithm,
+                (void *)workspace_buffer.get(), workspace_bytes, &beta,
+                dw_descriptor, out.device()));
+            return out;
+        } catch (const AfError &error) {
+            backwardFilterAlgorithmCache().erase(algorithm_key);
+            if (!cache_hit || attempt != 0 ||
+                error.getError() != AF_ERR_NO_MEM) {
+                throw;
+            }
+
+            tie(bwd_filt_convolution_algorithm, workspace_bytes) =
+                getBackwardFilterAlgorithm(
+                    cudnn, x_descriptor, dy_descriptor, convolution_descriptor,
+                    dw_descriptor, algorithm_key, &cache_hit);
+        }
+    }
 
     return out;
 }

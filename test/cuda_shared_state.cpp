@@ -8,15 +8,21 @@
  ********************************************************/
 
 #include <arrayfire.h>
+#include <cuda/cudnn_algorithm_cache.hpp>
+#include <cuda/cudnn_version.hpp>
 #include <gtest/gtest.h>
 #include <testHelpers.hpp>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <exception>
 #include <functional>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +30,19 @@
 namespace {
 
 using Operation = std::function<af::array(bool)>;
+
+struct CollidingIntHash {
+    size_t operator()(int) const { return 0; }
+};
+
+using TestAlgorithmCache =
+    arrayfire::cuda::detail::CudnnAlgorithmCache<int, size_t, CollidingIntHash,
+                                                 3>;
+using TestConvolutionKey =
+    arrayfire::cuda::detail::CudnnConvolutionAlgorithmKey;
+using TestConvolutionKeyCache = arrayfire::cuda::detail::CudnnAlgorithmCache<
+    TestConvolutionKey, size_t,
+    arrayfire::cuda::detail::CudnnConvolutionAlgorithmKeyHash, 16>;
 
 class StartGate {
    public:
@@ -48,6 +67,190 @@ class StartGate {
     std::mutex mutex_;
     std::condition_variable condition_;
 };
+
+TEST(CUDNNAlgorithmCache, ReusesValuesAndEvictsInFifoOrder) {
+    TestAlgorithmCache cache;
+    size_t value = 0;
+
+    EXPECT_FALSE(cache.find(1, &value));
+    EXPECT_EQ(11U, cache.insertOrGet(1, 11));
+    EXPECT_EQ(22U, cache.insertOrGet(2, 22));
+    EXPECT_EQ(33U, cache.insertOrGet(3, 33));
+    EXPECT_EQ(3U, cache.size());
+
+    EXPECT_TRUE(cache.find(1, &value));
+    EXPECT_EQ(11U, value);
+    EXPECT_EQ(11U, cache.insertOrGet(1, 99));
+
+    EXPECT_EQ(44U, cache.insertOrGet(4, 44));
+    EXPECT_EQ(TestAlgorithmCache::capacity(), cache.size());
+    EXPECT_FALSE(cache.find(1, &value));
+    EXPECT_TRUE(cache.find(4, &value));
+    EXPECT_EQ(44U, value);
+
+    cache.erase(4);
+    EXPECT_FALSE(cache.find(4, &value));
+    EXPECT_EQ(2U, cache.size());
+}
+
+TEST(CUDNNAlgorithmCache, SeparatesEveryConvolutionDescriptorField) {
+    TestConvolutionKey base =
+        arrayfire::cuda::detail::makeCudnnConvolutionAlgorithmKey(
+            af::dim4(32, 24, 2, 2), af::dim4(3, 5, 2, 4),
+            af::dim4(16, 24, 4, 2), af::dim4(2, 1), af::dim4(1, 2),
+            af::dim4(1, 1), 0);
+
+    std::vector<TestConvolutionKey> keys(8, base);
+    keys[1].input[0] += 1;
+    keys[2].filter[1] += 1;
+    keys[3].output[2] += 1;
+    keys[4].stride[0] += 1;
+    keys[5].padding[1] += 1;
+    keys[6].dilation[0] += 1;
+    keys[7].dataType += 1;
+
+    TestConvolutionKeyCache cache;
+    size_t selections = 0;
+    for (size_t index = 0; index < keys.size(); ++index) {
+        const auto result = cache.getOrCreate(keys[index], [&]() {
+            ++selections;
+            return index + 1;
+        });
+        EXPECT_EQ(index + 1, result.value);
+        EXPECT_EQ(TestConvolutionKeyCache::Lookup::Miss, result.lookup);
+    }
+
+    EXPECT_EQ(keys.size(), selections);
+    EXPECT_EQ(keys.size(), cache.size());
+    for (size_t index = 0; index < keys.size(); ++index) {
+        const auto result =
+            cache.getOrCreate(keys[index], []() { return 999U; });
+        EXPECT_EQ(index + 1, result.value);
+        EXPECT_EQ(TestConvolutionKeyCache::Lookup::Hit, result.lookup);
+    }
+}
+
+TEST(CUDNNAlgorithmCache, ConcurrentInsertionUsesOneStableWinner) {
+    TestAlgorithmCache cache;
+    using Lookup             = TestAlgorithmCache::Lookup;
+    const size_t threadCount = 8;
+    StartGate gate(threadCount);
+    std::atomic<size_t> selections(0);
+    std::vector<size_t> values(threadCount);
+    std::vector<Lookup> lookups(threadCount, Lookup::Hit);
+    std::vector<std::thread> threads;
+
+    for (size_t thread = 0; thread < threadCount; ++thread) {
+        threads.emplace_back([&, thread]() {
+            gate.wait();
+            const auto result = cache.getOrCreate(7, [&, thread]() {
+                ++selections;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                return thread + 1;
+            });
+            values[thread]    = result.value;
+            lookups[thread]   = result.lookup;
+        });
+    }
+    for (std::thread &thread : threads) { thread.join(); }
+
+    size_t winner = 0;
+    ASSERT_TRUE(cache.find(7, &winner));
+    EXPECT_EQ(1U, cache.size());
+    EXPECT_EQ(1U, selections);
+    for (size_t value : values) { EXPECT_EQ(winner, value); }
+
+    const size_t misses =
+        std::count(lookups.begin(), lookups.end(), Lookup::Miss);
+    const size_t waits =
+        std::count(lookups.begin(), lookups.end(), Lookup::Wait);
+    EXPECT_EQ(1U, misses);
+    EXPECT_EQ(threadCount,
+              misses + waits +
+                  std::count(lookups.begin(), lookups.end(), Lookup::Hit));
+}
+
+TEST(CUDNNAlgorithmCache, SelectsDifferentKeysConcurrently) {
+    TestAlgorithmCache cache;
+    StartGate gate(2);
+    std::mutex selectorMutex;
+    std::condition_variable selectorCondition;
+    size_t selectorsEntered = 0;
+    std::vector<std::string> errors(2);
+    std::vector<std::thread> threads;
+
+    for (size_t thread = 0; thread < 2; ++thread) {
+        threads.emplace_back([&, thread]() {
+            gate.wait();
+            try {
+                const auto result =
+                    cache.getOrCreate(static_cast<int>(thread), [&, thread]() {
+                        std::unique_lock<std::mutex> lock(selectorMutex);
+                        ++selectorsEntered;
+                        selectorCondition.notify_all();
+                        if (!selectorCondition.wait_for(
+                                lock, std::chrono::seconds(2),
+                                [&]() { return selectorsEntered == 2; })) {
+                            throw std::runtime_error(
+                                "selectors executed serially");
+                        }
+                        return thread + 1;
+                    });
+                if (result.value != thread + 1) {
+                    errors[thread] = "wrong selected value";
+                }
+            } catch (const std::exception &error) {
+                errors[thread] = error.what();
+            }
+        });
+    }
+    for (std::thread &thread : threads) { thread.join(); }
+
+    EXPECT_EQ(2U, selectorsEntered);
+    for (const std::string &error : errors) { EXPECT_TRUE(error.empty()); }
+}
+
+TEST(CUDNNAlgorithmCache, FailedSelectionIsRetried) {
+    TestAlgorithmCache cache;
+    size_t attempts = 0;
+
+    EXPECT_THROW(
+        cache.getOrCreate(9,
+                          [&]() -> size_t {
+                              ++attempts;
+                              throw std::runtime_error("selection failed");
+                          }),
+        std::runtime_error);
+    EXPECT_EQ(0U, cache.size());
+
+    const auto result = cache.getOrCreate(9, [&]() {
+        ++attempts;
+        return 99U;
+    });
+    EXPECT_EQ(99U, result.value);
+    EXPECT_EQ(2U, attempts);
+    EXPECT_EQ(1U, cache.size());
+}
+
+TEST(CUDNNVersion, ParsesLegacyAndVersionNineEncodings) {
+    const arrayfire::common::Version legacy =
+        arrayfire::cuda::cudnnVersionComponents(8907);
+    EXPECT_EQ(8, legacy.major());
+    EXPECT_EQ(9, legacy.minor());
+    EXPECT_EQ(7, legacy.patch());
+
+    const arrayfire::common::Version versionNine =
+        arrayfire::cuda::cudnnVersionComponents(90501);
+    EXPECT_EQ(9, versionNine.major());
+    EXPECT_EQ(5, versionNine.minor());
+    EXPECT_EQ(1, versionNine.patch());
+
+    const arrayfire::common::Version cudaRuntime =
+        arrayfire::cuda::cudnnCudaRuntimeVersionComponents(12081);
+    EXPECT_EQ(12, cudaRuntime.major());
+    EXPECT_EQ(8, cudaRuntime.minor());
+    EXPECT_EQ(1, cudaRuntime.patch());
+}
 
 std::vector<float> host(const af::array &value) {
     std::vector<float> output(value.elements());
@@ -150,6 +353,36 @@ TEST(CUDNNHandle, SurvivesFirstCallingThreadExit) {
 
     const std::vector<float> second = runConvolveNN();
     EXPECT_EQ(first, second);
+}
+
+TEST(CUDNNAlgorithmCache, RepeatedForwardAndBackwardFilterShapesStayAccurate) {
+    af::setDevice(0);
+    const af::dim4 stride(2, 1);
+    const af::dim4 padding(1, 2);
+    const af::dim4 dilation(1, 1);
+    af::array signal = af::randu(32, 24, 2, 2, f32);
+    af::array filter = af::randu(3, 5, 2, 4, f32);
+
+    af::array forward0 =
+        af::convolve2NN(signal, filter, stride, padding, dilation);
+    af::array forward1 = af::convolve2NN(signal.copy(), filter.copy(), stride,
+                                         padding, dilation);
+    forward0.eval();
+    forward1.eval();
+    af::sync();
+    ASSERT_ARRAYS_NEAR(forward0, forward1, 1.0e-4);
+
+    af::array incomingGradient = af::randu(forward0.dims(), f32);
+    af::array filterGradient0  = af::convolve2GradientNN(
+         incomingGradient, signal, filter, forward0, stride, padding, dilation,
+         AF_CONV_GRADIENT_FILTER);
+    af::array filterGradient1 = af::convolve2GradientNN(
+        incomingGradient.copy(), signal.copy(), filter.copy(), forward1, stride,
+        padding, dilation, AF_CONV_GRADIENT_FILTER);
+    filterGradient0.eval();
+    filterGradient1.eval();
+    af::sync();
+    ASSERT_ARRAYS_NEAR(filterGradient0, filterGradient1, 4.0e-3);
 }
 #endif
 
