@@ -13,6 +13,7 @@
 #include <common/Logger.hpp>
 #include <common/err_common.hpp>
 #include <common/util.hpp>
+#include <cudnn_version.hpp>
 #include <device_manager.hpp>
 #include <utility.hpp>
 
@@ -30,7 +31,8 @@ namespace cuda {
 
 // clang-format off
 // Latest version from each minor releases are enlisted below
-constexpr std::array<common::Version, 11> cudnnVersions = {
+constexpr std::array<common::Version, 12> cudnnVersions = {
+    Version(9, 0,  0),
     Version(8, 0,  1),
     Version(7, 6,  5),
     Version(7, 5,  1),
@@ -49,21 +51,6 @@ spdlog::logger* cudnnModule::getLogger() const noexcept {
     return module.getLogger();
 }
 
-Version cudnnVersionComponents(size_t version) {
-    int major = static_cast<int>(version / 1000);
-    int minor = static_cast<int>((version - (major * 1000)) / 100);
-    int patch = static_cast<int>(version - (major * 1000) - (minor * 100));
-    return {major, minor, patch};
-}
-
-Version cudaRuntimeVersionComponents(size_t version) {
-    int major = static_cast<int>(version / 1000);
-    int minor = static_cast<int>((version - (major * 1000)) / 10);
-    int patch =
-        static_cast<int>((version - (major * 1000) - (minor * 10)) / 10);
-    return {major, minor, patch};
-}
-
 Version getCudnnVersion(const LibHandle& handle) {
     std::function<size_t()> fptr(reinterpret_cast<size_t (*)()>(
         common::getFunctionPointer(handle, "cudnnGetVersion")));
@@ -73,8 +60,9 @@ Version getCudnnVersion(const LibHandle& handle) {
 }
 
 cudnnModule::cudnnModule()
-    : module({"cudnn"}, {"", "64_8", "64_7", "64_6", "64_5", "64_4"}, {""},
-             cudnnVersions.size(), cudnnVersions.data(), getCudnnVersion) {
+    : module({"cudnn"}, {"", "64_9", "64_8", "64_7", "64_6", "64_5", "64_4"},
+             {""}, cudnnVersions.size(), cudnnVersions.data(),
+             getCudnnVersion) {
     if (!module.isLoaded()) {
         AF_TRACE(
             "WARNING: Unable to load cuDNN: {}"
@@ -102,12 +90,13 @@ cudnnModule::cudnnModule()
         cudnn_rtversion_val = this->cudnnGetCudartVersion();
     }
 
-    Version cudnn_rtversion = cudaRuntimeVersionComponents(cudnn_rtversion_val);
+    Version cudnn_rtversion =
+        cudnnCudaRuntimeVersionComponents(cudnn_rtversion_val);
 
     AF_TRACE("cuDNN Version: {} cuDNN CUDA Runtime: {}", cudnn_version,
              cudnn_rtversion);
 
-    Version compiled_cudnn_version = fromCudaVersion(CUDNN_VERSION);
+    Version compiled_cudnn_version = cudnnVersionComponents(CUDNN_VERSION);
 
     // Check to see if the version of cuDNN ArrayFire was compiled against
     // is compatible with the version loaded at runtime

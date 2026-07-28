@@ -421,6 +421,8 @@ add_library(afcuda
 
     $<$<BOOL:${AF_WITH_CUDNN}>: cudnn.cpp
                              cudnn.hpp
+                             cudnn_algorithm_cache.hpp
+                             cudnn_version.hpp
                              cudnnModule.cpp
                              cudnnModule.hpp>
 

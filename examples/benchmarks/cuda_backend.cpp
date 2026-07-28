@@ -68,6 +68,12 @@ Options volumeOptions(const Options &options) {
     return volume;
 }
 
+Options neuralOptions(const Options &options) {
+    Options neural = options;
+    neural.size = std::max<dim_t>(32, std::min<dim_t>(512, options.size / 4));
+    return neural;
+}
+
 void materialize(const af::array &value) {
     value.eval();
     af::sync();
@@ -259,6 +265,71 @@ void runConvolution(const Options &options, cudaStream_t stream) {
                  measure(work, options.iterations, stream));
 }
 
+void runCudnnForward(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "cudnn_forward_3x3")) { return; }
+
+    const Options neural = neuralOptions(options);
+    af::deviceGC();
+
+    // Initialize the optional cuDNN plugin and handle with a different key so
+    // first_call_ms below isolates selection for the measured descriptor.
+    af::array primeSignal = af::randu(8, 8, 1, 1, f32);
+    af::array primeFilter = af::randu(1, 1, 1, 1, f32);
+    materialize(af::convolve2NN(primeSignal, primeFilter, af::dim4(1, 1),
+                                af::dim4(0, 0, 1, 1), af::dim4(1, 1)));
+
+    af::array signal = af::randu(neural.size, neural.size, 8, 2, f32);
+    af::array filter = af::randu(3, 3, 8, 16, f32);
+    materialize(signal);
+    materialize(filter);
+
+    Work work = [&signal, &filter]() {
+        return af::convolve2NN(signal, filter, af::dim4(1, 1), af::dim4(1, 1),
+                               af::dim4(1, 1));
+    };
+    printMetrics("cudnn_forward_3x3", neural,
+                 measure(work, neural.iterations, stream));
+}
+
+void runCudnnBackwardFilter(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "cudnn_backward_filter_3x3")) { return; }
+
+    const Options neural = neuralOptions(options);
+    af::deviceGC();
+
+    af::array primeSignal = af::randu(8, 8, 1, 1, f32);
+    af::array primeFilter = af::randu(1, 1, 1, 1, f32);
+    af::array primeOutput =
+        af::convolve2NN(primeSignal, primeFilter, af::dim4(1, 1),
+                        af::dim4(0, 0, 1, 1), af::dim4(1, 1));
+    af::array primeGradient = af::randu(primeOutput.dims(), f32);
+    materialize(af::convolve2GradientNN(
+        primeGradient, primeSignal, primeFilter, primeOutput, af::dim4(1, 1),
+        af::dim4(0, 0, 1, 1), af::dim4(1, 1), AF_CONV_GRADIENT_FILTER));
+
+    const af::dim4 stride(1, 1);
+    const af::dim4 padding(1, 1);
+    const af::dim4 dilation(1, 1);
+    af::array signal = af::randu(neural.size, neural.size, 8, 2, f32);
+    af::array filter = af::randu(3, 3, 8, 16, f32);
+    af::array output =
+        af::convolve2NN(signal, filter, stride, padding, dilation);
+    af::array incomingGradient = af::randu(output.dims(), f32);
+    materialize(signal);
+    materialize(filter);
+    materialize(output);
+    materialize(incomingGradient);
+
+    Work work = [&incomingGradient, &signal, &filter, &output, &stride,
+                 &padding, &dilation]() {
+        return af::convolve2GradientNN(incomingGradient, signal, filter, output,
+                                       stride, padding, dilation,
+                                       AF_CONV_GRADIENT_FILTER);
+    };
+    printMetrics("cudnn_backward_filter_3x3", neural,
+                 measure(work, neural.iterations, stream));
+}
+
 void runVolumeConvolution(const Options &options, cudaStream_t stream) {
     if (!selected(options, "convolve3_5x5_c64")) { return; }
 
@@ -340,6 +411,7 @@ Options parseOptions(int argc, char **argv) {
                          "[--iterations N] [--case NAME]\n"
                       << "Cases: all, jit_contiguous, jit_gapped, reduce_dim0, "
                          "matmul, sort_batched, convolve2_7x7, dilate_7x7, "
+                         "cudnn_forward_3x3, cudnn_backward_filter_3x3, "
                          "convolve3_5x5_c64, dilate3_7x7_f64, "
                          "transform_bilinear\n";
             std::exit(0);
@@ -390,6 +462,8 @@ int main(int argc, char **argv) {
         runMatmul(options, stream);
         runSort(options, stream);
         runConvolution(options, stream);
+        runCudnnForward(options, stream);
+        runCudnnBackwardFilter(options, stream);
         runVolumeConvolution(options, stream);
         runMorphology(options, stream);
         runVolumeMorphology(options, stream);
