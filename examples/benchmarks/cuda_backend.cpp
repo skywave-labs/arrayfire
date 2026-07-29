@@ -223,6 +223,127 @@ void runReduction(const Options &options, cudaStream_t stream) {
                  measure(work, options.iterations, stream));
 }
 
+af::array reductionProducer(const af::array &lhs, const af::array &rhs) {
+    return af::sin(lhs) * af::cos(rhs) + af::sqrt(af::abs(lhs - rhs) + 1.0f);
+}
+
+void runJitReductions(const Options &options, cudaStream_t stream) {
+    const bool runDim0 = selected(options, "reduce_jit_dim0") ||
+                         selected(options, "reduce_jit_dim0_materialized");
+    const bool runAll = selected(options, "reduce_jit_all") ||
+                        selected(options, "reduce_jit_all_materialized");
+    const bool runReuse = selected(options, "reduce_jit_reuse") ||
+                          selected(options, "reduce_jit_reuse_materialized");
+    if (!runDim0 && !runAll && !runReuse) { return; }
+
+    Options reduction = options;
+    reduction.size    = std::max<dim_t>(256, options.size);
+    af::deviceGC();
+    af::array lhs = af::randu(reduction.size, reduction.size, f32);
+    af::array rhs = af::randu(reduction.size, reduction.size, f32);
+    materialize(lhs);
+    materialize(rhs);
+
+    if (selected(options, "reduce_jit_dim0")) {
+        af::deviceGC();
+        Work work = [lhs, rhs]() {
+            return af::sum(reductionProducer(lhs, rhs), 0);
+        };
+        printMetrics("reduce_jit_dim0", reduction,
+                     measure(work, reduction.iterations, stream));
+    }
+
+    if (selected(options, "reduce_jit_dim0_materialized")) {
+        af::deviceGC();
+        Work work = [lhs, rhs]() {
+            af::array expression = reductionProducer(lhs, rhs);
+            expression.eval();
+            return af::sum(expression, 0);
+        };
+        printMetrics("reduce_jit_dim0_materialized", reduction,
+                     measure(work, reduction.iterations, stream));
+    }
+
+    if (selected(options, "reduce_jit_all")) {
+        af::deviceGC();
+        Work work = [lhs, rhs]() {
+            return af::sum<af::array>(reductionProducer(lhs, rhs));
+        };
+        printMetrics("reduce_jit_all", reduction,
+                     measure(work, reduction.iterations, stream));
+    }
+
+    if (selected(options, "reduce_jit_all_materialized")) {
+        af::deviceGC();
+        Work work = [lhs, rhs]() {
+            af::array expression = reductionProducer(lhs, rhs);
+            expression.eval();
+            return af::sum<af::array>(expression);
+        };
+        printMetrics("reduce_jit_all_materialized", reduction,
+                     measure(work, reduction.iterations, stream));
+    }
+
+    if (selected(options, "reduce_jit_reuse")) {
+        af::deviceGC();
+        Work work = [lhs, rhs]() {
+            af::array expression = reductionProducer(lhs, rhs);
+            return af::sum(expression, 0) + af::sum(expression, 0);
+        };
+        printMetrics("reduce_jit_reuse", reduction,
+                     measure(work, reduction.iterations, stream));
+    }
+
+    if (selected(options, "reduce_jit_reuse_materialized")) {
+        af::deviceGC();
+        Work work = [lhs, rhs]() {
+            af::array expression = reductionProducer(lhs, rhs);
+            expression.eval();
+            return af::sum(expression, 0) + af::sum(expression, 0);
+        };
+        printMetrics("reduce_jit_reuse_materialized", reduction,
+                     measure(work, reduction.iterations, stream));
+    }
+}
+
+void runShortJitReduction(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "reduce_jit_short_dim0")) { return; }
+
+    af::deviceGC();
+    constexpr dim_t lineLength = 32;
+    const dim_t lines          = std::max<dim_t>(2048, options.size * 32);
+    af::array lhs              = af::randu(lineLength, lines, f32);
+    af::array rhs              = af::randu(lineLength, lines, f32);
+    materialize(lhs);
+    materialize(rhs);
+
+    Work work = [lhs, rhs]() {
+        return af::sum(reductionProducer(lhs, rhs), 0);
+    };
+    printMetrics("reduce_jit_short_dim0", options,
+                 measure(work, options.iterations, stream));
+}
+
+void runGappedJitReduction(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "reduce_jit_gapped")) { return; }
+
+    Options reduction = options;
+    reduction.size    = std::max<dim_t>(256, options.size);
+    af::deviceGC();
+    af::array lhsBase = af::randu(reduction.size * 2, reduction.size, f32);
+    af::array rhsBase = af::randu(reduction.size * 2, reduction.size, f32);
+    materialize(lhsBase);
+    materialize(rhsBase);
+    af::array lhs = lhsBase(af::seq(0, reduction.size * 2 - 2, 2), af::span);
+    af::array rhs = rhsBase(af::seq(0, reduction.size * 2 - 2, 2), af::span);
+
+    Work work = [lhs, rhs]() {
+        return af::sum(reductionProducer(lhs, rhs), 0);
+    };
+    printMetrics("reduce_jit_gapped", reduction,
+                 measure(work, reduction.iterations, stream));
+}
+
 void runMatmul(const Options &options, cudaStream_t stream) {
     if (!selected(options, "matmul")) { return; }
 
@@ -619,6 +740,10 @@ Options parseOptions(int argc, char **argv) {
             std::cout << "Usage: cuda_backend_cuda [--device N] [--size N] "
                          "[--iterations N] [--case NAME]\n"
                       << "Cases: all, jit_contiguous, jit_gapped, reduce_dim0, "
+                         "reduce_jit_dim0, reduce_jit_dim0_materialized, "
+                         "reduce_jit_all, reduce_jit_all_materialized, "
+                         "reduce_jit_reuse, reduce_jit_reuse_materialized, "
+                         "reduce_jit_short_dim0, reduce_jit_gapped, "
                          "matmul, matmul_batched_8, "
                          "matmul_batched_d2_broadcast_8, matmul_batched_256, "
                          "sort_batched, sort_values_32, sort_values_32_dim1, "
@@ -675,6 +800,9 @@ int main(int argc, char **argv) {
         runJitContiguous(options, stream);
         runJitGapped(options, stream);
         runReduction(options, stream);
+        runJitReductions(options, stream);
+        runShortJitReduction(options, stream);
+        runGappedJitReduction(options, stream);
         runMatmul(options, stream);
         runBatchedMatmul(options, stream);
         runBroadcastBatchedMatmul(options, stream);

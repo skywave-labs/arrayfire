@@ -11,7 +11,8 @@ files are available, `cuda_backend_cuda` records:
 - changes in ArrayFire's allocated and locked memory-pool state.
 
 The suite covers contiguous and gapped JIT expressions, dimensional reduction,
-standard and batched matrix multiplication, long-line batched sorting, short
+lazy-producer reduction with explicitly materialized controls, standard and
+batched matrix multiplication, long-line batched sorting, short
 and medium segmented value/index/key-value sorting, nonzero-dimension sorting
 with reorder cost, the iterative-sort fallback, 1-D and 2-D/3-D spatial
 convolution, separable convolution, cuDNN NN forward/backward-filter
@@ -37,6 +38,19 @@ Use `--case NAME` to isolate a row and `--help` to list the case names. Output
 is CSV so results from two revisions can be compared directly. Automated
 performance checks should compare revisions on an otherwise idle GPU rather
 than enforce fixed absolute time limits.
+
+The `reduce_jit_dim0` and `reduce_jit_all` rows consume the same lazy
+trigonometric expression as their `_materialized` controls. Comparing each
+pair measures the end-to-end effect of consuming the producer directly,
+including the avoided allocation, launch, global write, and global read. The
+`reduce_jit_reuse` pair measures the opposite tradeoff: a named lazy expression
+used by two reductions can be recomputed by consumer fusion, while the
+materialized control produces it once. These eligible cases use at least
+256×256 elements even when a smaller `--size` is requested. The
+`reduce_jit_short_dim0` and `reduce_jit_gapped` rows exercise the protected
+short-line and non-linear fallbacks. Run each row in a separate process with
+`--case NAME` when comparing cold compilation; an `all` run shares the JIT
+module cache across rows.
 
 The `cudnn_forward_3x3` and `cudnn_backward_filter_3x3` rows initialize the
 plugin and handle with a different descriptor first. Their `first_call_ms`

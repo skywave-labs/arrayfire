@@ -22,9 +22,7 @@
 #include <cub/warp/warp_reduce.cuh>
 
 #include <climits>
-#include <vector>
-
-using std::unique_ptr;
+#include <cstdint>
 
 namespace arrayfire {
 namespace cuda {
@@ -310,10 +308,9 @@ __global__ static void reduce_all_kernel(Param<To> out,
 
     out_val = WarpReduce(temp_storage[warpid]).Reduce(out_val, reduce);
 
-    if (cond && lid == 0) {
-        s_val[warpid] = out_val;
-    } else if (!cond) {
-        s_val[warpid] = common::Binary<compute_t<To>, op>::init();
+    if (lid == 0) {
+        s_val[warpid] =
+            cond ? out_val : common::Binary<compute_t<To>, op>::init();
     }
     __syncthreads();
 
@@ -324,12 +321,12 @@ __global__ static void reduce_all_kernel(Param<To> out,
     }
 
     const unsigned total_blocks = (gridDim.x * gridDim.y * gridDim.z);
-    const int uubidx            = (gridDim.x * gridDim.y) * blockIdx.z +
-                       (gridDim.x * blockIdx.y) + blockIdx.x;
-    if (cond && tid == 0) {
+    const uint uubidx           = (gridDim.x * gridDim.y) * blockIdx.z +
+                        (gridDim.x * blockIdx.y) + blockIdx.x;
+    if (tid == 0) {
         if (total_blocks != 1) {
             tmp.ptr[uubidx] = data_t<To>(out_val);
-        } else {
+        } else if (cond) {
             out.ptr[0] = data_t<To>(out_val);
         }
     }
@@ -351,8 +348,8 @@ __global__ static void reduce_all_kernel(Param<To> out,
         __syncthreads();  // for amlast
 
         if (amLast) {
-            int i   = tid;
-            out_val = common::Binary<compute_t<To>, op>::init();
+            uint64_t i = tid;
+            out_val    = common::Binary<compute_t<To>, op>::init();
 
             while (i < total_blocks) {
                 compute_t<To> in_val = compute_t<To>(tmp.ptr[i]);
@@ -371,12 +368,7 @@ __global__ static void reduce_all_kernel(Param<To> out,
                 out_val = WarpReduce(temp_storage[0]).Reduce(out_val, reduce);
             }
 
-            if (tid == 0) {
-                out.ptr[0] = out_val;
-
-                // reset retirement count so that next run succeeds
-                retirementCount.ptr[0] = 0;
-            }
+            if (tid == 0) { out.ptr[0] = out_val; }
         }
     }
 }
@@ -394,33 +386,51 @@ void reduce_all_launcher(Param<To> out, CParam<Ti> in, const uint blocks_x,
     blocks.z             = divup(blocks.y, maxBlocksY);
     blocks.y             = divup(blocks.y, blocks.z);
 
-    long tmp_elements = blocks.x * blocks.y * blocks.z;
+    const uint64_t tmp_elements =
+        static_cast<uint64_t>(blocks.x) * blocks.y * blocks.z;
     if (tmp_elements > UINT_MAX) {
         AF_ERROR("Too many blocks requested (retirementCount == unsigned)",
                  AF_ERR_RUNTIME);
     }
-    Array<To> tmp                   = createEmptyArray<To>(tmp_elements);
-    Array<unsigned> retirementCount = createValueArray<unsigned>(1, 0);
+    Param<To> tmp = out;
+    Param<unsigned> retirement_count;
+    uptr<To> tmp_allocation;
+    uptr<unsigned> retirement_allocation;
+    if (tmp_elements > 1) {
+        const dim_t tmp_size      = static_cast<dim_t>(tmp_elements);
+        const dim_t tmp_dims[]    = {tmp_size, 1, 1, 1};
+        const dim_t tmp_strides[] = {1, tmp_size, tmp_size, tmp_size};
+        const dim_t one[]         = {1, 1, 1, 1};
+
+        tmp_allocation = memAlloc<To>(tmp_elements);
+        tmp            = Param<To>(tmp_allocation.get(), tmp_dims, tmp_strides);
+
+        retirement_allocation = memAlloc<unsigned>(1);
+        CUDA_CHECK(cudaMemsetAsync(retirement_allocation.get(), 0,
+                                   sizeof(unsigned), getActiveStream()));
+        retirement_count =
+            Param<unsigned>(retirement_allocation.get(), one, one);
+    }
 
     switch (threads_x) {
         case 32:
             CUDA_LAUNCH((reduce_all_kernel<Ti, To, op, 32>), blocks, threads,
-                        out, retirementCount, tmp, in, blocks_x, blocks_y,
+                        out, retirement_count, tmp, in, blocks_x, blocks_y,
                         repeat, change_nan, scalar<To>(nanval));
             break;
         case 64:
             CUDA_LAUNCH((reduce_all_kernel<Ti, To, op, 64>), blocks, threads,
-                        out, retirementCount, tmp, in, blocks_x, blocks_y,
+                        out, retirement_count, tmp, in, blocks_x, blocks_y,
                         repeat, change_nan, scalar<To>(nanval));
             break;
         case 128:
             CUDA_LAUNCH((reduce_all_kernel<Ti, To, op, 128>), blocks, threads,
-                        out, retirementCount, tmp, in, blocks_x, blocks_y,
+                        out, retirement_count, tmp, in, blocks_x, blocks_y,
                         repeat, change_nan, scalar<To>(nanval));
             break;
         case 256:
             CUDA_LAUNCH((reduce_all_kernel<Ti, To, op, 256>), blocks, threads,
-                        out, retirementCount, tmp, in, blocks_x, blocks_y,
+                        out, retirement_count, tmp, in, blocks_x, blocks_y,
                         repeat, change_nan, scalar<To>(nanval));
             break;
     }
