@@ -19,6 +19,7 @@
 #include <cublas_v2.h>
 #include <cudaDataType.hpp>
 #include <cuda_runtime.h>
+#include <debug_cuda.hpp>
 #include <err_cuda.hpp>
 #include <math.hpp>
 #include <platform.hpp>
@@ -31,15 +32,33 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 using arrayfire::common::half;
 using arrayfire::common::kernel_type;
 using std::is_same;
-using std::vector;
 
 namespace arrayfire {
 namespace cuda {
+
+namespace {
+
+template<typename Ti, typename To>
+__global__ void setBatchedGemmPointers(
+    const Ti **lPtrs, const Ti **rPtrs, To **oPtrs, const Ti *lhs,
+    const Ti *rhs, To *out, const dim_t lStride2, const dim_t lStride3,
+    const dim_t rStride2, const dim_t rStride3, const dim_t oStride2,
+    const dim_t oStride3, const int batchDim2, const int batchSize) {
+    const int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= batchSize) { return; }
+
+    const int z = id % batchDim2;
+    const int w = id / batchDim2;
+    lPtrs[id]   = lhs + z * lStride2 + w * lStride3;
+    rPtrs[id]   = rhs + z * rStride2 + w * rStride3;
+    oPtrs[id]   = out + z * oStride2 + w * oStride3;
+}
+
+}  // namespace
 
 cublasOperation_t toCblasTranspose(af_mat_prop opt) {
     cublasOperation_t out = CUBLAS_OP_N;
@@ -175,14 +194,14 @@ cublasGemmAlgo_t selectGEMMAlgorithm<__half>() {
 template<typename Ti, typename To = Ti>
 cublasStatus_t gemmDispatch(BlasHandle handle, cublasOperation_t lOpts,
                             cublasOperation_t rOpts, int M, int N, int K,
-                            const To *alpha, const Array<Ti> &lhs, dim_t lStride,
-                            const Array<Ti> &rhs, dim_t rStride, const To *beta,
-                            Array<To> &out, dim_t oleading) {
+                            const To *alpha, const Array<Ti> &lhs,
+                            dim_t lStride, const Array<Ti> &rhs, dim_t rStride,
+                            const To *beta, Array<To> &out, dim_t oleading) {
     auto prop = getDeviceProp(getActiveDeviceId());
 #if __CUDACC_VER_MAJOR__ >= 10
     if (prop.major > 3 && __CUDACC_VER_MAJOR__ >= 10) {
         return cublasGemmEx(
-            blasHandle(), lOpts, rOpts, M, N, K, alpha, lhs.get(), getType<Ti>(),
+            handle, lOpts, rOpts, M, N, K, alpha, lhs.get(), getType<Ti>(),
             lStride, rhs.get(), getType<Ti>(), rStride, beta, out.get(),
             getType<To>(), out.strides()[1],
             getComputeType<To>(),  // Compute type
@@ -199,7 +218,7 @@ cublasStatus_t gemmDispatch(BlasHandle handle, cublasOperation_t lOpts,
     } else {
 #endif
         using Nt = typename common::kernel_type<Ti>::native;
-        return gemm_func<Nt>()(blasHandle(), lOpts, rOpts, M, N, K, (Nt *)alpha,
+        return gemm_func<Nt>()(handle, lOpts, rOpts, M, N, K, (Nt *)alpha,
                                (Nt *)lhs.get(), lStride, (Nt *)rhs.get(),
                                rStride, (Nt *)beta, (Nt *)out.get(), oleading);
 
@@ -219,10 +238,10 @@ cublasStatus_t gemmBatchedDispatch(BlasHandle handle, cublasOperation_t lOpts,
 #if __CUDACC_VER_MAJOR__ >= 10
     if (prop.major > 3) {
         return cublasGemmBatchedEx(
-            blasHandle(), lOpts, rOpts, M, N, K, alpha, (const void **)lptrs,
+            handle, lOpts, rOpts, M, N, K, alpha, (const void **)lptrs,
             getType<Ti>(), lStrides, (const void **)rptrs, getType<Ti>(),
-            rStrides, beta, (void **)optrs, getType<Ti>(), oStrides, batchSize,
-            getComputeType<Ti>(),  // compute type
+            rStrides, beta, (void **)optrs, getType<To>(), oStrides, batchSize,
+            getComputeType<To>(),  // compute type
             // NOTE: When using the CUBLAS_GEMM_DEFAULT_TENSOR_OP algorithm
             // for the cublasGemm*Ex functions, the performance of the
             // fp32 numbers seem to increase dramatically. Their numerical
@@ -236,7 +255,7 @@ cublasStatus_t gemmBatchedDispatch(BlasHandle handle, cublasOperation_t lOpts,
 #endif
         using Nt = typename common::kernel_type<Ti>::native;
         return gemmBatched_func<Nt>()(
-            blasHandle(), lOpts, rOpts, M, N, K, (const Nt *)alpha,
+            handle, lOpts, rOpts, M, N, K, (const Nt *)alpha,
             (const Nt **)lptrs, lStrides, (const Nt **)rptrs, rStrides,
             (const Nt *)beta, (Nt **)optrs, oStrides, batchSize);
 #if __CUDACC_VER_MAJOR__ >= 10
@@ -245,8 +264,9 @@ cublasStatus_t gemmBatchedDispatch(BlasHandle handle, cublasOperation_t lOpts,
 }
 
 template<typename Ti, typename To>
-void gemm(Array<To> &out, af_mat_prop optLhs, af_mat_prop optRhs, const To *alpha,
-          const Array<Ti> &lhs, const Array<Ti> &rhs, const To *beta) {
+void gemm(Array<To> &out, af_mat_prop optLhs, af_mat_prop optRhs,
+          const To *alpha, const Array<Ti> &lhs, const Array<Ti> &rhs,
+          const To *beta) {
     const cublasOperation_t lOpts = toCblasTranspose(optLhs);
     const cublasOperation_t rOpts = toCblasTranspose(optRhs);
 
@@ -266,58 +286,38 @@ void gemm(Array<To> &out, af_mat_prop optLhs, af_mat_prop optRhs, const To *alph
     dim4 oStrides = out.strides();
 
     if (oDims.ndims() <= 2) {
-        CUBLAS_CHECK((gemmDispatch<Ti, To>(blasHandle(), lOpts, rOpts, M, N, K, alpha,
-                                           lhs, lStrides[1], rhs, rStrides[1], beta,
-                                           out, oStrides[1])));
+        CUBLAS_CHECK((gemmDispatch<Ti, To>(
+            blasHandle(), lOpts, rOpts, M, N, K, alpha, lhs, lStrides[1], rhs,
+            rStrides[1], beta, out, oStrides[1])));
     } else {
-        int batchSize = oDims[2] * oDims[3];
-        vector<const Ti *> lptrs(batchSize);
-        vector<const Ti *> rptrs(batchSize);
-        vector<To *> optrs(batchSize);
+        const int batchSize = oDims[2] * oDims[3];
+        const size_t pointerArrayBytes =
+            static_cast<size_t>(batchSize) * sizeof(void *);
+        auto pointerStorage  = memAlloc<uchar>(3 * pointerArrayBytes);
+        uchar *const storage = pointerStorage.get();
 
-        bool is_l_d2_batched = oDims[2] == lDims[2];
-        bool is_l_d3_batched = oDims[3] == lDims[3];
+        auto d_lptrs = reinterpret_cast<const Ti **>(storage);
+        auto d_rptrs =
+            reinterpret_cast<const Ti **>(storage + pointerArrayBytes);
+        auto d_optrs = reinterpret_cast<To **>(storage + 2 * pointerArrayBytes);
 
-        bool is_r_d2_batched = oDims[2] == rDims[2];
-        bool is_r_d3_batched = oDims[3] == rDims[3];
+        const dim_t lStride2 = lDims[2] == oDims[2] ? lStrides[2] : dim_t{0};
+        const dim_t lStride3 = lDims[3] == oDims[3] ? lStrides[3] : dim_t{0};
+        const dim_t rStride2 = rDims[2] == oDims[2] ? rStrides[2] : dim_t{0};
+        const dim_t rStride3 = rDims[3] == oDims[3] ? rStrides[3] : dim_t{0};
 
-        const Ti *lptr = lhs.get();
-        const Ti *rptr = rhs.get();
-        To *optr    = out.get();
+        constexpr unsigned THREADS = 256;
+        const dim3 threads(THREADS);
+        const dim3 blocks((batchSize + THREADS - 1) / THREADS);
+        CUDA_LAUNCH((setBatchedGemmPointers<Ti, To>), blocks, threads, d_lptrs,
+                    d_rptrs, d_optrs, lhs.get(), rhs.get(), out.get(), lStride2,
+                    lStride3, rStride2, rStride3, oStrides[2], oStrides[3],
+                    oDims[2], batchSize);
+        POST_LAUNCH_CHECK();
 
-        for (int n = 0; n < batchSize; n++) {
-            int w    = n / oDims[2];
-            int z    = n - w * oDims[2];
-            int loff = z * (is_l_d2_batched * lStrides[2]) +
-                       w * (is_l_d3_batched * lStrides[3]);
-            int roff = z * (is_r_d2_batched * rStrides[2]) +
-                       w * (is_r_d3_batched * rStrides[3]);
-            lptrs[n] = lptr + loff;
-            rptrs[n] = rptr + roff;
-            optrs[n] = optr + z * oStrides[2] + w * oStrides[3];
-        }
-
-        size_t bytes = batchSize * sizeof(Ti **);
-        auto d_lptrs = memAlloc<uchar>(bytes);
-        auto d_rptrs = memAlloc<uchar>(bytes);
-        auto d_optrs = memAlloc<uchar>(bytes);
-        CUDA_CHECK(cudaMemcpyAsync(d_lptrs.get(), lptrs.data(), bytes,
-                                   cudaMemcpyHostToDevice, getActiveStream()));
-        CUDA_CHECK(cudaMemcpyAsync(d_rptrs.get(), rptrs.data(), bytes,
-                                   cudaMemcpyHostToDevice, getActiveStream()));
-        CUDA_CHECK(cudaMemcpyAsync(d_optrs.get(), optrs.data(), bytes,
-                                   cudaMemcpyHostToDevice, getActiveStream()));
-
-        // Call this before the gemm call so that you don't have to wait for the
-        // computation. Even though it would make more sense to put it
-        // afterwards
-        CUDA_CHECK(cudaStreamSynchronize(getActiveStream()));
-
-        using Nt = typename common::kernel_type<Ti>::native;
         CUBLAS_CHECK(gemmBatchedDispatch(
-            blasHandle(), lOpts, rOpts, M, N, K, alpha,
-            (const Ti **)d_lptrs.get(), lStrides[1], (const Ti **)d_rptrs.get(),
-            rStrides[1], beta, (To **)d_optrs.get(), oStrides[1], batchSize));
+            blasHandle(), lOpts, rOpts, M, N, K, alpha, d_lptrs, lStrides[1],
+            d_rptrs, rStrides[1], beta, d_optrs, oStrides[1], batchSize));
     }
 }
 

@@ -236,6 +236,54 @@ void runMatmul(const Options &options, cudaStream_t stream) {
     printMetrics("matmul", options, measure(work, options.iterations, stream));
 }
 
+void runBatchedMatmul(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "matmul_batched_8")) { return; }
+
+    af::deviceGC();
+    const dim_t batches = std::max<dim_t>(2, options.size);
+    af::array lhs       = af::randu(8, 8, batches, f32);
+    af::array rhs       = af::randu(8, 8, batches, f32);
+    materialize(lhs);
+    materialize(rhs);
+
+    Work work = [lhs, rhs]() { return af::matmul(lhs, rhs); };
+    printMetrics("matmul_batched_8", options,
+                 measure(work, options.iterations, stream));
+}
+
+void runBroadcastBatchedMatmul(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "matmul_batched_d2_broadcast_8")) { return; }
+
+    af::deviceGC();
+    constexpr dim_t batchDim2 = 8;
+    const dim_t batchDim3 =
+        std::max<dim_t>(2, (options.size + batchDim2 - 1) / batchDim2);
+    af::array lhs = af::randu(8, 8, 1, batchDim3, f32);
+    af::array rhs = af::randu(8, 8, batchDim2, batchDim3, f32);
+    materialize(lhs);
+    materialize(rhs);
+
+    Work work = [lhs, rhs]() { return af::matmul(lhs, rhs); };
+    printMetrics("matmul_batched_d2_broadcast_8", options,
+                 measure(work, options.iterations, stream));
+}
+
+void runComputeBoundBatchedMatmul(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "matmul_batched_256")) { return; }
+
+    af::deviceGC();
+    const dim_t batches =
+        std::max<dim_t>(2, std::min<dim_t>(16, options.size / 256));
+    af::array lhs = af::randu(256, 256, batches, f32);
+    af::array rhs = af::randu(256, 256, batches, f32);
+    materialize(lhs);
+    materialize(rhs);
+
+    Work work = [lhs, rhs]() { return af::matmul(lhs, rhs); };
+    printMetrics("matmul_batched_256", options,
+                 measure(work, options.iterations, stream));
+}
+
 void runSort(const Options &options, cudaStream_t stream) {
     if (!selected(options, "sort_batched")) { return; }
 
@@ -410,7 +458,9 @@ Options parseOptions(int argc, char **argv) {
             std::cout << "Usage: cuda_backend_cuda [--device N] [--size N] "
                          "[--iterations N] [--case NAME]\n"
                       << "Cases: all, jit_contiguous, jit_gapped, reduce_dim0, "
-                         "matmul, sort_batched, convolve2_7x7, dilate_7x7, "
+                         "matmul, matmul_batched_8, "
+                         "matmul_batched_d2_broadcast_8, matmul_batched_256, "
+                         "sort_batched, convolve2_7x7, dilate_7x7, "
                          "cudnn_forward_3x3, cudnn_backward_filter_3x3, "
                          "convolve3_5x5_c64, dilate3_7x7_f64, "
                          "transform_bilinear\n";
@@ -460,6 +510,9 @@ int main(int argc, char **argv) {
         runJitGapped(options, stream);
         runReduction(options, stream);
         runMatmul(options, stream);
+        runBatchedMatmul(options, stream);
+        runBroadcastBatchedMatmul(options, stream);
+        runComputeBoundBatchedMatmul(options, stream);
         runSort(options, stream);
         runConvolution(options, stream);
         runCudnnForward(options, stream);
