@@ -10,6 +10,7 @@
 #include <Array.hpp>
 #include <copy.hpp>
 #include <err_cuda.hpp>
+#include <kernel/segmented_sort.hpp>
 #include <kernel/sort.hpp>
 #include <math.hpp>
 #include <reorder.hpp>
@@ -20,6 +21,24 @@ namespace arrayfire {
 namespace cuda {
 template<typename T>
 Array<T> sort(const Array<T> &in, const unsigned dim, bool isAscending) {
+    if (kernel::useSegmentedSort(in.dims(), dim, false)) {
+        Array<T> sorted = [&]() {
+            Array<T> ordered =
+                dim == 0
+                    ? (in.isReady() && in.isLinear() ? in : copyArray<T>(in))
+                    : reorder<T>(in, kernel::sortPreorder(dim));
+            Array<T> result = createEmptyArray<T>(ordered.dims());
+            kernel::segmentedSortKeys(result.get(), ordered.get(),
+                                      static_cast<int>(ordered.elements()),
+                                      static_cast<int>(ordered.dims()[0]),
+                                      isAscending);
+            return result;
+        }();
+
+        return dim == 0 ? sorted
+                        : reorder<T>(sorted, kernel::sortPostorder(dim));
+    }
+
     Array<T> out = copyArray<T>(in);
     switch (dim) {
         case 0: kernel::sort0<T>(out, isAscending); break;

@@ -365,6 +365,8 @@ add_library(afcuda
     kernel/scan_first.hpp
     kernel/scan_first_by_key.hpp
     kernel/scan_first_by_key_impl.hpp
+    kernel/segmented_sort.hpp
+    kernel/segmented_sort_impl.hpp
     kernel/select.hpp
     kernel/shared.hpp
     kernel/shfl_intrinsics.hpp

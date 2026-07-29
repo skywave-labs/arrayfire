@@ -28,6 +28,13 @@ foreach(SBK_TYPE ${SBK_TYPES})
       "${CMAKE_CURRENT_BINARY_DIR}/kernel/thrust_sort_by_key/thrust_sort_by_key_impl_${SBK_TYPE}_${SBK_INST}.cu"
     )
 
+    if(SBK_INST STREQUAL "0")
+      set_property(
+        SOURCE "${CMAKE_CURRENT_BINARY_DIR}/kernel/thrust_sort_by_key/thrust_sort_by_key_impl_${SBK_TYPE}_${SBK_INST}.cu"
+        APPEND PROPERTY COMPILE_DEFINITIONS AF_CUDA_SEGMENTED_SORT_INSTANCE
+      )
+    endif()
+
     list(
       APPEND
       thrust_sort_sources

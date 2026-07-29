@@ -24,3 +24,5 @@ using ThrustVector = thrust::device_vector<T, ThrustAllocator<T>>;
     fn(arrayfire::cuda::ThrustArrayFirePolicy(), __VA_ARGS__)
 #define THRUST_SELECT_OUT(res, fn, ...) \
     res = fn(arrayfire::cuda::ThrustArrayFirePolicy(), __VA_ARGS__)
+#define THRUST_SELECT_NOSYNC(fn, ...) \
+    fn(arrayfire::cuda::ThrustArrayFireNoSyncPolicy(), __VA_ARGS__)

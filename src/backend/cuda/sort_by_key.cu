@@ -10,6 +10,7 @@
 #include <Array.hpp>
 #include <copy.hpp>
 #include <err_cuda.hpp>
+#include <kernel/segmented_sort.hpp>
 #include <kernel/sort_by_key.hpp>
 #include <math.hpp>
 #include <reorder.hpp>
@@ -21,6 +22,39 @@ namespace cuda {
 template<typename Tk, typename Tv>
 void sort_by_key(Array<Tk> &okey, Array<Tv> &oval, const Array<Tk> &ikey,
                  const Array<Tv> &ival, const uint dim, bool isAscending) {
+    if (kernel::useSegmentedSort(ikey.dims(), dim, true)) {
+        {
+            Array<Tk> orderedKeys =
+                dim == 0
+                    ? (ikey.isReady() && ikey.isLinear() ? ikey
+                                                         : copyArray<Tk>(ikey))
+                    : reorder<Tk>(ikey, kernel::sortPreorder(dim));
+            Array<Tv> orderedValues =
+                dim == 0
+                    ? (ival.isReady() && ival.isLinear() ? ival
+                                                         : copyArray<Tv>(ival))
+                    : reorder<Tv>(ival, kernel::sortPreorder(dim));
+
+            okey                = createEmptyArray<Tk>(orderedKeys.dims());
+            oval                = createEmptyArray<Tv>(orderedValues.dims());
+            Array<uint> indices = createEmptyArray<uint>(orderedKeys.dims());
+            const int elements  = static_cast<int>(orderedKeys.elements());
+            const int segmentLength = static_cast<int>(orderedKeys.dims()[0]);
+
+            kernel::segmentedSortPairs(okey.get(), indices.get(),
+                                       orderedKeys.get(), elements,
+                                       segmentLength, isAscending);
+            kernel::gatherSegmented(oval.get(), orderedValues.get(),
+                                    indices.get(), elements, segmentLength);
+        }
+
+        if (dim != 0) {
+            okey = reorder<Tk>(okey, kernel::sortPostorder(dim));
+            oval = reorder<Tv>(oval, kernel::sortPostorder(dim));
+        }
+        return;
+    }
+
     okey = copyArray<Tk>(ikey);
     oval = copyArray<Tv>(ival);
 

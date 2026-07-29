@@ -11,10 +11,12 @@ files are available, `cuda_backend_cuda` records:
 - changes in ArrayFire's allocated and locked memory-pool state.
 
 The suite covers contiguous and gapped JIT expressions, dimensional reduction,
-matrix multiplication, batched sorting, 2-D/3-D spatial convolution,
-cuDNN NN forward/backward-filter convolution, 2-D/3-D morphology, and image
-transforms. The 3-D and NN cases derive bounded dimensions from `--size` so the
-default run remains practical. Run every case with:
+matrix multiplication, long-line batched sorting, short and medium segmented
+value/index/key-value sorting, nonzero-dimension sorting with reorder cost, the
+iterative-sort fallback, 2-D/3-D spatial convolution, cuDNN NN forward/backward
+filter convolution, 2-D/3-D morphology, and image transforms. The 3-D and NN
+cases derive bounded dimensions from `--size` so the default run remains
+practical. Run every case with:
 
 ```sh
 ./cuda_backend_cuda --device 0 --size 2048 --iterations 20
