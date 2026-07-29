@@ -356,7 +356,51 @@ void runShortSegmentSorts(const Options &options, cudaStream_t stream) {
 
 void runMediumSegmentSorts(const Options &options, cudaStream_t stream) {
     constexpr dim_t lineLength = 256;
-    const dim_t batches        = std::max<dim_t>(32, options.size / 2);
+    const dim_t batches          = std::max<dim_t>(32, options.size / 2);
+    const dim_t segmentedBatches =
+        std::max<dim_t>(32, std::min<dim_t>(128, options.size / 2));
+
+    if (selected(options, "sort_values_256_segmented")) {
+        af::deviceGC();
+        af::array input = af::randu(lineLength, segmentedBatches, f32);
+        materialize(input);
+
+        Work work = [input]() { return af::sort(input, 0, true); };
+        printMetrics("sort_values_256_segmented", options,
+                     measure(work, options.iterations, stream));
+    }
+
+    if (selected(options, "sort_index_256_segmented")) {
+        af::deviceGC();
+        af::array input = af::randu(lineLength, segmentedBatches, f32);
+        materialize(input);
+
+        Work work = [input]() {
+            af::array keys;
+            af::array indices;
+            af::sort(keys, indices, input, 0, true);
+            return keys;
+        };
+        printMetrics("sort_index_256_segmented", options,
+                     measure(work, options.iterations, stream));
+    }
+
+    if (selected(options, "sort_by_key_256_segmented")) {
+        af::deviceGC();
+        af::array keys   = af::randu(lineLength, segmentedBatches, f32);
+        af::array values = af::randu(lineLength, segmentedBatches, c64);
+        materialize(keys);
+        materialize(values);
+
+        Work work = [keys, values]() {
+            af::array sortedKeys;
+            af::array sortedValues;
+            af::sort(sortedKeys, sortedValues, keys, values, 0, true);
+            return sortedKeys;
+        };
+        printMetrics("sort_by_key_256_segmented", options,
+                     measure(work, options.iterations, stream));
+    }
 
     if (selected(options, "sort_index_256")) {
         af::deviceGC();
@@ -389,6 +433,38 @@ void runMediumSegmentSorts(const Options &options, cudaStream_t stream) {
         printMetrics("sort_by_key_256", options,
                      measure(work, options.iterations, stream));
     }
+
+    if (selected(options, "sort_index_256_gapped_1024")) {
+        af::deviceGC();
+        constexpr dim_t regressionBatches = 1024;
+        af::array base  = af::randu(regressionBatches * 2, lineLength, f32);
+        af::array input =
+            base(af::seq(0, regressionBatches * 2 - 2, 2), af::span);
+        materialize(input);
+
+        Work work = [input]() {
+            af::array keys;
+            af::array indices;
+            af::sort(keys, indices, input, 1, false);
+            return keys;
+        };
+        printMetrics("sort_index_256_gapped_1024", options,
+                     measure(work, options.iterations, stream));
+    }
+}
+
+void runLongSegmentSort(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "sort_values_100000")) { return; }
+
+    af::deviceGC();
+    constexpr dim_t lineLength = 100000;
+    constexpr dim_t batches    = 11;
+    af::array input             = af::randu(lineLength, batches, f32);
+    materialize(input);
+
+    Work work = [input]() { return af::sort(input, 0, true); };
+    printMetrics("sort_values_100000", options,
+                 measure(work, options.iterations, stream));
 }
 
 void runIterativeSort(const Options &options, cudaStream_t stream) {
@@ -622,8 +698,12 @@ Options parseOptions(int argc, char **argv) {
                          "matmul, matmul_batched_8, "
                          "matmul_batched_d2_broadcast_8, matmul_batched_256, "
                          "sort_batched, sort_values_32, sort_values_32_dim1, "
-                         "sort_index_32, sort_by_key_32, sort_index_256, "
-                         "sort_by_key_256, sort_values_iterative_10, "
+                         "sort_index_32, sort_by_key_32, "
+                         "sort_values_256_segmented, "
+                         "sort_index_256_segmented, "
+                         "sort_by_key_256_segmented, sort_index_256, "
+                         "sort_by_key_256, sort_index_256_gapped_1024, "
+                         "sort_values_100000, sort_values_iterative_10, "
                          "convolve1_9, convolve2_7x7, "
                          "convolve2_separable_7x7, dilate_7x7, "
                          "cudnn_forward_3x3, cudnn_backward_filter_3x3, "
@@ -682,6 +762,7 @@ int main(int argc, char **argv) {
         runSort(options, stream);
         runShortSegmentSorts(options, stream);
         runMediumSegmentSorts(options, stream);
+        runLongSegmentSort(options, stream);
         runIterativeSort(options, stream);
         runOneDimensionalConvolution(options, stream);
         runConvolution(options, stream);

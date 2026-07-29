@@ -10,34 +10,13 @@
 #pragma once
 
 #include <debug_cuda.hpp>
+#include <kernel/segmented_sort_dispatch.hpp>
 #include <platform.hpp>
 #include <types.hpp>
-#include <af/dim4.hpp>
-
-#include <limits>
 
 namespace arrayfire {
 namespace cuda {
 namespace kernel {
-
-inline bool useSegmentedSort(const af::dim4 &dims, unsigned dim,
-                             bool hasValues) {
-    if (dim >= 4) { return false; }
-
-    const dim_t segmentLength = dims[dim];
-    const dim_t elements      = dims.elements();
-    if (segmentLength <= 1 || elements <= 0 ||
-        elements > std::numeric_limits<int>::max()) {
-        return false;
-    }
-
-    const dim_t segments = elements / segmentLength;
-    if (segments > std::numeric_limits<int>::max()) { return false; }
-
-    // Preserve the existing batched-sort gates until native measurements
-    // justify widening the segmented path.
-    return hasValues ? segments > 4 && segmentLength < 100000 : segments > 10;
-}
 
 inline af::dim4 sortPreorder(unsigned dim) {
     af::dim4 order(0, 1, 2, 3);

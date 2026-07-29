@@ -347,6 +347,14 @@ make_test(SRC convolve.cpp CXX11)
 make_test(SRC corrcoef.cpp)
 make_test(SRC covariance.cpp)
 if(AF_BUILD_CUDA)
+  make_test(
+    SRC cuda_segmented_sort_dispatch.cpp
+    CXX11
+    BACKENDS "cuda")
+  target_include_directories(
+    test_cuda_segmented_sort_dispatch_cuda
+    PRIVATE ${ArrayFire_SOURCE_DIR}/src/backend)
+
   if(AF_WITH_CUDNN)
     set(cuda_shared_state_definitions AF_TEST_WITH_CUDNN)
   endif()

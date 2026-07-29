@@ -12,12 +12,13 @@ files are available, `cuda_backend_cuda` records:
 
 The suite covers contiguous and gapped JIT expressions, dimensional reduction,
 standard and batched matrix multiplication, long-line batched sorting, short
-and medium segmented value/index/key-value sorting, nonzero-dimension sorting
-with reorder cost, the iterative-sort fallback, 1-D and 2-D/3-D spatial
-convolution, separable convolution, cuDNN NN forward/backward-filter
-convolution, 2-D/3-D morphology, and affine and perspective image transforms.
-The 3-D and NN cases derive bounded dimensions from `--size` so the default run
-remains practical.
+and medium value/index/key-value sorting across the segmented and
+high-segment-count fallback paths, a gapped dimension-1 256-by-1,024 index
+fallback, a 100,000-element-line fallback case, nonzero-dimension sorting with
+reorder cost, the iterative-sort fallback, 1-D and 2-D/3-D spatial convolution,
+separable convolution, cuDNN NN forward/backward-filter convolution, 2-D/3-D
+morphology, and affine and perspective image transforms. The 3-D and NN cases
+derive bounded dimensions from `--size` so the default run remains practical.
 
 A focused preset configures a CUDA-only build and compiles just this benchmark:
 
