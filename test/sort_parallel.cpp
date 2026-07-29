@@ -27,6 +27,28 @@ namespace {
 
 const dim4 parallelDims(257, 17, 7, 20);
 
+#ifdef AF_CUDA
+dim4 segmentedDims(const unsigned dim) {
+    // Keep every axis nontrivial while holding the parallel line count inside
+    // the measured segmented-sort envelope.
+    dim4 dims(2, 3, 4, 5);
+    dims[dim] = 257;
+    return dims;
+}
+#endif
+
+vector<dim4> sortTestDims(const unsigned dim) {
+    vector<dim4> dims(1, parallelDims);
+#ifdef AF_CUDA
+    // Supplement the shared CPU/CUDA matrix with a shape that exercises the
+    // CUDA segmented-sort path on every axis.
+    dims.push_back(segmentedDims(dim));
+#else
+    (void)dim;
+#endif
+    return dims;
+}
+
 size_t linearIndex(const dim4 &dims, const dim_t x, const dim_t y,
                    const dim_t z, const dim_t w) {
     return static_cast<size_t>(x + dims[0] * (y + dims[1] * (z + dims[2] * w)));
@@ -116,8 +138,7 @@ void assertFloatingKeys(const vector<T> &expected, const dim4 &dims,
 }
 
 template<typename T>
-void checkFloatingSignedZeroAssociations() {
-    const dim4 dims(64, 257);
+void checkFloatingSignedZeroAssociations(const dim4 &dims) {
     const size_t elements = static_cast<size_t>(dims.elements());
     vector<T> keys(elements);
     vector<unsigned> payload(elements);
@@ -225,127 +246,14 @@ void checkDim0ViewSorts(const array &key_view, const array &payload_view,
     ASSERT_VEC_ARRAY_EQ(expected_payload, dims, sorted_payload);
 }
 
-}  // namespace
-
-TEST(SortParallel, ValuesAcrossAllDimensions) {
-    const size_t elements = static_cast<size_t>(parallelDims.elements());
-
-    for (unsigned dim = 0; dim < 4; ++dim) {
-        const bool ascending    = dim % 2 == 0;
-        const dim_t line_length = parallelDims[dim];
-        const size_t line_count = elements / static_cast<size_t>(line_length);
-        vector<int> values(elements);
-
-        for (size_t line = 0; line < line_count; ++line) {
-            for (dim_t element = 0; element < line_length; ++element) {
-                const size_t index =
-                    lineElementIndex(parallelDims, dim, line, element);
-                values[index] =
-                    static_cast<int>(
-                        (37 * static_cast<size_t>(element) + 13 * line) % 97) -
-                    48;
-            }
-        }
-
-        vector<int> expected = values;
-        if (ascending) {
-            sortLinesReference(expected, parallelDims, dim, std::less<int>());
-        } else {
-            sortLinesReference(expected, parallelDims, dim,
-                               std::greater<int>());
-        }
-
-        SCOPED_TRACE(::testing::Message()
-                     << "dim=" << dim << " ascending=" << ascending);
-        const array input(parallelDims, values.data());
-        const array output = af::sort(input, dim, ascending);
-        ASSERT_VEC_ARRAY_EQ(expected, parallelDims, output);
-    }
-}
-
-TEST(SortParallel, StableAssociationsAcrossAllDimensions) {
-    const size_t elements = static_cast<size_t>(parallelDims.elements());
-
-    for (unsigned dim = 0; dim < 4; ++dim) {
-        const bool ascending    = dim % 2 != 0;
-        const dim_t line_length = parallelDims[dim];
-        const size_t line_count = elements / static_cast<size_t>(line_length);
-        vector<int> keys(elements);
-        vector<unsigned> indices(elements);
-        vector<unsigned> payload(elements);
-
-        for (size_t line = 0; line < line_count; ++line) {
-            for (dim_t element = 0; element < line_length; ++element) {
-                const size_t index =
-                    lineElementIndex(parallelDims, dim, line, element);
-                keys[index] =
-                    static_cast<int>((2 * static_cast<size_t>(element) + line) %
-                                     3) -
-                    1;
-                indices[index] = static_cast<unsigned>(element);
-                payload[index] = static_cast<unsigned>(
-                    line * static_cast<size_t>(line_length) +
-                    static_cast<size_t>(element));
-            }
-        }
-
-        vector<int> expected_index_keys   = keys;
-        vector<unsigned> expected_indices = indices;
-        vector<int> expected_payload_keys = keys;
-        vector<unsigned> expected_payload = payload;
-        if (ascending) {
-            stableSortLinesByKeyReference(expected_index_keys, expected_indices,
-                                          parallelDims, dim, std::less<int>());
-            stableSortLinesByKeyReference(expected_payload_keys,
-                                          expected_payload, parallelDims, dim,
-                                          std::less<int>());
-        } else {
-            stableSortLinesByKeyReference(expected_index_keys, expected_indices,
-                                          parallelDims, dim,
-                                          std::greater<int>());
-            stableSortLinesByKeyReference(expected_payload_keys,
-                                          expected_payload, parallelDims, dim,
-                                          std::greater<int>());
-        }
-
-        const array key_array(parallelDims, keys.data());
-        {
-            SCOPED_TRACE(::testing::Message() << "sortIndex dim=" << dim
-                                              << " ascending=" << ascending);
-            array sorted_keys;
-            array sorted_indices;
-            af::sort(sorted_keys, sorted_indices, key_array, dim, ascending);
-            ASSERT_VEC_ARRAY_EQ(expected_index_keys, parallelDims, sorted_keys);
-            ASSERT_VEC_ARRAY_EQ(expected_indices, parallelDims, sorted_indices);
-        }
-
-        const array payload_array(parallelDims, payload.data());
-        {
-            SCOPED_TRACE(::testing::Message() << "sortByKey dim=" << dim
-                                              << " ascending=" << ascending);
-            array sorted_payload_keys;
-            array sorted_payload;
-            af::sort(sorted_payload_keys, sorted_payload, key_array,
-                     payload_array, dim, ascending);
-            ASSERT_VEC_ARRAY_EQ(expected_payload_keys, parallelDims,
-                                sorted_payload_keys);
-            ASSERT_VEC_ARRAY_EQ(expected_payload, parallelDims, sorted_payload);
-        }
-    }
-}
-
-TEST(SortParallel, FloatingSignedZeroAssociationsRemainStable) {
-    SKIP_IF_FAST_MATH_ENABLED();
-    checkFloatingSignedZeroAssociations<float>();
-    checkFloatingSignedZeroAssociations<double>();
-}
-
-TEST(SortParallel, QueuedSegmentedSortReusesBuffersSafely) {
-    const dim4 dims(32, 1024);
+void checkQueuedValueSortReuse(const dim4 &dims) {
     const size_t elements = static_cast<size_t>(dims.elements());
     vector<int> values(elements);
     for (size_t i = 0; i < elements; ++i) {
-        values[i] = static_cast<int>((i * 37 + i / 32) % 101) - 50;
+        values[i] =
+            static_cast<int>(
+                (i * 37 + i / static_cast<size_t>(dims[0])) % 101) -
+            50;
     }
 
     vector<int> expected = values;
@@ -362,6 +270,150 @@ TEST(SortParallel, QueuedSegmentedSortReusesBuffersSafely) {
         ASSERT_VEC_ARRAY_EQ(expected, dims, output);
     }
 }
+
+}  // namespace
+
+TEST(SortParallel, ValuesAcrossAllDimensions) {
+    for (unsigned dim = 0; dim < 4; ++dim) {
+        for (const dim4 &dims : sortTestDims(dim)) {
+            const size_t elements   = static_cast<size_t>(dims.elements());
+            const bool ascending    = dim % 2 == 0;
+            const dim_t line_length = dims[dim];
+            const size_t line_count =
+                elements / static_cast<size_t>(line_length);
+            vector<int> values(elements);
+
+            for (size_t line = 0; line < line_count; ++line) {
+                for (dim_t element = 0; element < line_length; ++element) {
+                    const size_t index =
+                        lineElementIndex(dims, dim, line, element);
+                    values[index] =
+                        static_cast<int>((37 * static_cast<size_t>(element) +
+                                          13 * line) %
+                                         97) -
+                        48;
+                }
+            }
+
+            vector<int> expected = values;
+            if (ascending) {
+                sortLinesReference(expected, dims, dim, std::less<int>());
+            } else {
+                sortLinesReference(expected, dims, dim, std::greater<int>());
+            }
+
+            SCOPED_TRACE(::testing::Message()
+                         << "dim=" << dim << " lines=" << line_count
+                         << " ascending=" << ascending);
+            const array input(dims, values.data());
+            const array output = af::sort(input, dim, ascending);
+            ASSERT_VEC_ARRAY_EQ(expected, dims, output);
+        }
+    }
+}
+
+TEST(SortParallel, StableAssociationsAcrossAllDimensions) {
+    for (unsigned dim = 0; dim < 4; ++dim) {
+        for (const dim4 &dims : sortTestDims(dim)) {
+            const size_t elements   = static_cast<size_t>(dims.elements());
+            const bool ascending    = dim % 2 != 0;
+            const dim_t line_length = dims[dim];
+            const size_t line_count =
+                elements / static_cast<size_t>(line_length);
+            vector<int> keys(elements);
+            vector<unsigned> indices(elements);
+            vector<unsigned> payload(elements);
+
+            for (size_t line = 0; line < line_count; ++line) {
+                for (dim_t element = 0; element < line_length; ++element) {
+                    const size_t index =
+                        lineElementIndex(dims, dim, line, element);
+                    keys[index] =
+                        static_cast<int>(
+                            (2 * static_cast<size_t>(element) + line) % 3) -
+                        1;
+                    indices[index] = static_cast<unsigned>(element);
+                    payload[index] = static_cast<unsigned>(
+                        line * static_cast<size_t>(line_length) +
+                        static_cast<size_t>(element));
+                }
+            }
+
+            vector<int> expected_index_keys   = keys;
+            vector<unsigned> expected_indices = indices;
+            vector<int> expected_payload_keys = keys;
+            vector<unsigned> expected_payload = payload;
+            if (ascending) {
+                stableSortLinesByKeyReference(
+                    expected_index_keys, expected_indices, dims, dim,
+                    std::less<int>());
+                stableSortLinesByKeyReference(expected_payload_keys,
+                                              expected_payload, dims, dim,
+                                              std::less<int>());
+            } else {
+                stableSortLinesByKeyReference(
+                    expected_index_keys, expected_indices, dims, dim,
+                    std::greater<int>());
+                stableSortLinesByKeyReference(expected_payload_keys,
+                                              expected_payload, dims, dim,
+                                              std::greater<int>());
+            }
+
+            const array key_array(dims, keys.data());
+            {
+                SCOPED_TRACE(::testing::Message()
+                             << "sortIndex dim=" << dim
+                             << " lines=" << line_count
+                             << " ascending=" << ascending);
+                array sorted_keys;
+                array sorted_indices;
+                af::sort(sorted_keys, sorted_indices, key_array, dim,
+                         ascending);
+                ASSERT_VEC_ARRAY_EQ(expected_index_keys, dims, sorted_keys);
+                ASSERT_VEC_ARRAY_EQ(expected_indices, dims, sorted_indices);
+            }
+
+            const array payload_array(dims, payload.data());
+            {
+                SCOPED_TRACE(::testing::Message()
+                             << "sortByKey dim=" << dim
+                             << " lines=" << line_count
+                             << " ascending=" << ascending);
+                array sorted_payload_keys;
+                array sorted_payload;
+                af::sort(sorted_payload_keys, sorted_payload, key_array,
+                         payload_array, dim, ascending);
+                ASSERT_VEC_ARRAY_EQ(expected_payload_keys, dims,
+                                    sorted_payload_keys);
+                ASSERT_VEC_ARRAY_EQ(expected_payload, dims, sorted_payload);
+            }
+        }
+    }
+}
+
+TEST(SortParallel, FloatingSignedZeroAssociationsRemainStable) {
+    SKIP_IF_FAST_MATH_ENABLED();
+    checkFloatingSignedZeroAssociations<float>(dim4(64, 257));
+    checkFloatingSignedZeroAssociations<double>(dim4(64, 257));
+#ifdef AF_CUDA
+    checkFloatingSignedZeroAssociations<float>(dim4(64, 127));
+    checkFloatingSignedZeroAssociations<double>(dim4(64, 127));
+#endif
+}
+
+TEST(SortParallel, QueuedHighSegmentCountFallbackReusesBuffersSafely) {
+    checkQueuedValueSortReuse(dim4(32, 1024));
+}
+
+#ifdef AF_CUDA
+TEST(SortParallel, QueuedSegmentedSortReusesBuffersSafely) {
+    checkQueuedValueSortReuse(dim4(256, 64));
+}
+
+TEST(SortParallel, QueuedJustAboveSegmentLimitFallbackReusesBuffersSafely) {
+    checkQueuedValueSortReuse(dim4(32, 129));
+}
+#endif
 
 TEST(SortParallel, QueuedNoSyncFallbackReusesBuffersSafely) {
     // Four lines stay below both segmented-sort thresholds, exercising the
