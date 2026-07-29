@@ -420,6 +420,114 @@ TEST_P(MatrixMultiplyBatch, Batched) {
     ASSERT_ARRAYS_NEAR(gold, out, 1e-3);
 }
 
+TEST(MatrixMultiplyBatchPointers, GridTailAndDim2Broadcast) {
+    const dim_t batchDim2 = 257;
+    const dim_t batchDim3 = 3;
+
+    array lhsBroadcast    = constant(2.0f, 3, 2, 1, batchDim3, f32);
+    array rhsBatched      = constant(3.0f, 2, 4, batchDim2, batchDim3, f32);
+    array lhsBroadcastOut = matmul(lhsBroadcast, rhsBatched);
+
+    array lhsBroadcastExpected =
+        constant(12.0f, 3, 4, batchDim2, batchDim3, f32);
+    ASSERT_ARRAYS_EQ(lhsBroadcastExpected, lhsBroadcastOut);
+
+    array lhsBatched      = constant(4.0f, 3, 2, batchDim2, batchDim3, f32);
+    array rhsBroadcast    = constant(5.0f, 2, 4, 1, batchDim3, f32);
+    array rhsBroadcastOut = matmul(lhsBatched, rhsBroadcast);
+
+    array rhsBroadcastExpected =
+        constant(40.0f, 3, 4, batchDim2, batchDim3, f32);
+    ASSERT_ARRAYS_EQ(rhsBroadcastExpected, rhsBroadcastOut);
+}
+
+TEST(MatrixMultiplyBatchPointers, GappedFourDimensionalInputs) {
+    const dim_t batchDim2 = 4;
+    const dim_t batchDim3 = 3;
+
+    array lhsBase = randu(7, 5, 9, batchDim3, f32);
+    array rhsBase = randu(5, 6, 9, batchDim3, f32);
+    array lhs     = lhsBase(span, span, af::seq(1, 2 * batchDim2 - 1, 2), span);
+    array rhs     = rhsBase(span, span, af::seq(1, 2 * batchDim2 - 1, 2), span);
+    array out     = matmul(lhs, rhs);
+
+    for (dim_t w = 0; w < batchDim3; ++w) {
+        for (dim_t z = 0; z < batchDim2; ++z) {
+            array expected =
+                matmul(lhs(span, span, z, w), rhs(span, span, z, w));
+            ASSERT_ARRAYS_NEAR(expected, out(span, span, z, w), 1e-4);
+        }
+    }
+}
+
+TEST(MatrixMultiplyBatchPointers, PreallocatedFourDimensionalOutput) {
+    const dim4 outDims(3, 4, 4, 3);
+    array lhs      = constant(2.0f, 3, 2, 1, outDims[3], f32);
+    array rhs      = constant(3.0f, 2, 4, outDims[2], outDims[3], f32);
+    array expected = constant(22.0f, outDims, f32);
+
+    TestOutputArrayInfo metadata(SUB_ARRAY);
+    af_array out = 0;
+    genTestOutputArray(&out, 5.0, outDims.ndims(), outDims.get(), f32,
+                       &metadata);
+
+    const float alpha = 1.0f;
+    const float beta  = 2.0f;
+    ASSERT_SUCCESS(af_gemm(&out, AF_MAT_NONE, AF_MAT_NONE, &alpha, lhs.get(),
+                           rhs.get(), &beta));
+    ASSERT_SPECIAL_ARRAYS_EQ(expected.get(), out, &metadata);
+}
+
+TEST(MatrixMultiplyBatchPointers, S8FloatOutput) {
+    af_backend backend;
+    ASSERT_SUCCESS(af_get_active_backend(&backend));
+    if (backend != AF_BACKEND_CUDA) {
+        GTEST_SKIP() << "Batched s8 GEMM is CUDA-only";
+    }
+
+    array lhs = constant(2, 4, 4, 5, s8);
+    array rhs = constant(3, 4, 4, 5, s8);
+    array out = matmul(lhs, rhs);
+
+    array expected = constant(24.0f, 4, 4, 5, f32);
+    ASSERT_ARRAYS_EQ(expected, out);
+}
+
+TEST(MatrixMultiplyBatchPointers, QueuedTemporaryLifetime) {
+    af_backend backend;
+    ASSERT_SUCCESS(af_get_active_backend(&backend));
+    if (backend != AF_BACKEND_CUDA) {
+        GTEST_SKIP() << "Temporary pointer arrays are CUDA-specific";
+    }
+
+    constexpr int calls = 32;
+    const dim4 outDims(3, 4, 17, 2);
+    array lhsA = constant(2.0f, 3, 2, outDims[2], outDims[3], f32);
+    array rhsA = constant(3.0f, 2, 4, outDims[2], outDims[3], f32);
+    array lhsB = constant(4.0f, 3, 2, 1, outDims[3], f32);
+    array rhsB = constant(5.0f, 2, 4, outDims[2], outDims[3], f32);
+    lhsA.eval();
+    rhsA.eval();
+    lhsB.eval();
+    rhsB.eval();
+    af::sync();
+
+    vector<array> outputs;
+    outputs.reserve(calls);
+    for (int i = 0; i < calls; ++i) {
+        outputs.emplace_back(i % 2 == 0 ? matmul(lhsA, rhsA)
+                                        : matmul(lhsB, rhsB));
+        outputs.back().eval();
+    }
+    af::sync();
+
+    array expectedA = constant(12.0f, outDims, f32);
+    array expectedB = constant(40.0f, outDims, f32);
+    for (int i = 0; i < calls; ++i) {
+        ASSERT_ARRAYS_EQ(i % 2 == 0 ? expectedA : expectedB, outputs[i]);
+    }
+}
+
 float alpha = 1.f;
 float beta  = 0.f;
 
