@@ -14,6 +14,7 @@
 #include <testHelpers.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -42,7 +43,42 @@ using TestConvolutionKey =
     arrayfire::cuda::detail::CudnnConvolutionAlgorithmKey;
 using TestConvolutionKeyCache = arrayfire::cuda::detail::CudnnAlgorithmCache<
     TestConvolutionKey, size_t,
-    arrayfire::cuda::detail::CudnnConvolutionAlgorithmKeyHash, 16>;
+    arrayfire::cuda::detail::CudnnConvolutionAlgorithmKeyHash, 32>;
+
+thread_local bool trackNextHash = false;
+std::mutex trackedHashMutex;
+std::condition_variable trackedHashCondition;
+size_t trackedHashEntrants = 0;
+
+struct TrackingIntHash {
+    size_t operator()(int) const {
+        if (trackNextHash) {
+            trackNextHash = false;
+            {
+                std::lock_guard<std::mutex> lock(trackedHashMutex);
+                ++trackedHashEntrants;
+            }
+            trackedHashCondition.notify_all();
+        }
+        return 0;
+    }
+};
+
+using FailureTrackingCache =
+    arrayfire::cuda::detail::CudnnAlgorithmCache<int, size_t, TrackingIntHash,
+                                                 3>;
+
+void resetTrackedHashEntrants() {
+    std::lock_guard<std::mutex> lock(trackedHashMutex);
+    trackedHashEntrants = 0;
+}
+
+bool waitForTrackedHashEntrants(size_t expected) {
+    std::unique_lock<std::mutex> lock(trackedHashMutex);
+    return trackedHashCondition.wait_for(
+        lock, std::chrono::seconds(10),
+        [expected]() { return trackedHashEntrants == expected; });
+}
 
 class StartGate {
    public:
@@ -100,14 +136,51 @@ TEST(CUDNNAlgorithmCache, SeparatesEveryConvolutionDescriptorField) {
             af::dim4(16, 24, 4, 2), af::dim4(2, 1), af::dim4(1, 2),
             af::dim4(1, 1), 0);
 
-    std::vector<TestConvolutionKey> keys(8, base);
-    keys[1].input[0] += 1;
-    keys[2].filter[1] += 1;
-    keys[3].output[2] += 1;
-    keys[4].stride[0] += 1;
-    keys[5].padding[1] += 1;
-    keys[6].dilation[0] += 1;
-    keys[7].dataType += 1;
+    EXPECT_EQ((std::array<dim_t, 4>{{32, 24, 2, 2}}), base.input);
+    EXPECT_EQ((std::array<dim_t, 4>{{3, 5, 2, 4}}), base.filter);
+    EXPECT_EQ((std::array<dim_t, 4>{{16, 24, 4, 2}}), base.output);
+    EXPECT_EQ((std::array<dim_t, 2>{{2, 1}}), base.stride);
+    EXPECT_EQ((std::array<dim_t, 2>{{1, 2}}), base.padding);
+    EXPECT_EQ((std::array<dim_t, 2>{{1, 1}}), base.dilation);
+    EXPECT_EQ(0, base.dataType);
+
+    std::vector<TestConvolutionKey> keys(1, base);
+    for (size_t coordinate = 0; coordinate < base.input.size(); ++coordinate) {
+        TestConvolutionKey key = base;
+        ++key.input[coordinate];
+        keys.push_back(key);
+    }
+    for (size_t coordinate = 0; coordinate < base.filter.size(); ++coordinate) {
+        TestConvolutionKey key = base;
+        ++key.filter[coordinate];
+        keys.push_back(key);
+    }
+    for (size_t coordinate = 0; coordinate < base.output.size(); ++coordinate) {
+        TestConvolutionKey key = base;
+        ++key.output[coordinate];
+        keys.push_back(key);
+    }
+    for (size_t coordinate = 0; coordinate < base.stride.size(); ++coordinate) {
+        TestConvolutionKey key = base;
+        ++key.stride[coordinate];
+        keys.push_back(key);
+    }
+    for (size_t coordinate = 0; coordinate < base.padding.size();
+         ++coordinate) {
+        TestConvolutionKey key = base;
+        ++key.padding[coordinate];
+        keys.push_back(key);
+    }
+    for (size_t coordinate = 0; coordinate < base.dilation.size();
+         ++coordinate) {
+        TestConvolutionKey key = base;
+        ++key.dilation[coordinate];
+        keys.push_back(key);
+    }
+    TestConvolutionKey differentType = base;
+    ++differentType.dataType;
+    keys.push_back(differentType);
+    ASSERT_EQ(20U, keys.size());
 
     TestConvolutionKeyCache cache;
     size_t selections = 0;
@@ -128,6 +201,48 @@ TEST(CUDNNAlgorithmCache, SeparatesEveryConvolutionDescriptorField) {
         EXPECT_EQ(index + 1, result.value);
         EXPECT_EQ(TestConvolutionKeyCache::Lookup::Hit, result.lookup);
     }
+}
+
+TEST(CUDNNAlgorithmCache, ErasePreservesFifoOrderAcrossRefill) {
+    TestAlgorithmCache cache;
+    size_t value = 0;
+
+    EXPECT_EQ(11U, cache.insertOrGet(1, 11));
+    EXPECT_EQ(22U, cache.insertOrGet(2, 22));
+    EXPECT_EQ(33U, cache.insertOrGet(3, 33));
+
+    cache.erase(2);
+    cache.erase(2);
+    EXPECT_EQ(44U, cache.insertOrGet(4, 44));
+    EXPECT_EQ(TestAlgorithmCache::capacity(), cache.size());
+    EXPECT_TRUE(cache.find(1, &value));
+    EXPECT_FALSE(cache.find(2, &value));
+    EXPECT_TRUE(cache.find(3, &value));
+    EXPECT_TRUE(cache.find(4, &value));
+
+    EXPECT_EQ(55U, cache.insertOrGet(5, 55));
+    EXPECT_FALSE(cache.find(1, &value));
+    EXPECT_TRUE(cache.find(3, &value));
+    EXPECT_TRUE(cache.find(4, &value));
+    EXPECT_TRUE(cache.find(5, &value));
+
+    size_t selections = 0;
+    const auto refill = cache.getOrCreate(2, [&]() {
+        ++selections;
+        return 22U;
+    });
+    EXPECT_EQ(22U, refill.value);
+    EXPECT_EQ(TestAlgorithmCache::Lookup::Miss, refill.lookup);
+    EXPECT_EQ(1U, selections);
+    EXPECT_FALSE(cache.find(3, &value));
+
+    const auto hit = cache.getOrCreate(2, [&]() {
+        ++selections;
+        return 999U;
+    });
+    EXPECT_EQ(22U, hit.value);
+    EXPECT_EQ(TestAlgorithmCache::Lookup::Hit, hit.lookup);
+    EXPECT_EQ(1U, selections);
 }
 
 TEST(CUDNNAlgorithmCache, ConcurrentInsertionUsesOneStableWinner) {
@@ -232,6 +347,67 @@ TEST(CUDNNAlgorithmCache, FailedSelectionIsRetried) {
     EXPECT_EQ(1U, cache.size());
 }
 
+TEST(CUDNNAlgorithmCache,
+     ConcurrentSelectionFailurePropagatesAndLaterRetryIsCached) {
+    FailureTrackingCache cache;
+    EXPECT_EQ(111U, cache.insertOrGet(-1, 111));
+
+    using Lookup             = FailureTrackingCache::Lookup;
+    const size_t threadCount = 8;
+    StartGate gate(threadCount);
+    std::atomic<size_t> failedSelections(0);
+    std::vector<std::string> errors(threadCount);
+    std::vector<std::thread> threads;
+    resetTrackedHashEntrants();
+
+    for (size_t thread = 0; thread < threadCount; ++thread) {
+        threads.emplace_back([&, thread]() {
+            gate.wait();
+            trackNextHash = true;
+            try {
+                cache.getOrCreate(7, [&]() -> size_t {
+                    ++failedSelections;
+                    if (!waitForTrackedHashEntrants(threadCount)) {
+                        throw std::runtime_error(
+                            "not every caller reached the cache");
+                    }
+                    throw std::runtime_error("selection failed");
+                });
+                errors[thread] = "selection unexpectedly succeeded";
+            } catch (const std::exception &error) {
+                errors[thread] = error.what();
+            }
+        });
+    }
+    for (std::thread &thread : threads) { thread.join(); }
+
+    EXPECT_EQ(1U, failedSelections);
+    for (const std::string &error : errors) {
+        EXPECT_EQ("selection failed", error);
+    }
+    EXPECT_EQ(1U, cache.size());
+    size_t value = 0;
+    EXPECT_FALSE(cache.find(7, &value));
+
+    size_t retrySelections = 0;
+    const auto retry       = cache.getOrCreate(7, [&]() {
+        ++retrySelections;
+        return 77U;
+    });
+    EXPECT_EQ(77U, retry.value);
+    EXPECT_EQ(Lookup::Miss, retry.lookup);
+    EXPECT_EQ(1U, retrySelections);
+
+    const auto hit = cache.getOrCreate(7, [&]() {
+        ++retrySelections;
+        return 999U;
+    });
+    EXPECT_EQ(77U, hit.value);
+    EXPECT_EQ(Lookup::Hit, hit.lookup);
+    EXPECT_EQ(1U, retrySelections);
+    EXPECT_EQ(2U, cache.size());
+}
+
 TEST(CUDNNVersion, ParsesLegacyAndVersionNineEncodings) {
     const arrayfire::common::Version legacy =
         arrayfire::cuda::cudnnVersionComponents(8907);
@@ -328,7 +504,267 @@ void verifyConcurrent(const Operation &operation, float tolerance,
     }
 }
 
+void verifyTransformBatchBeyondLegacyConstantMemory(bool perspective) {
+    af::setDevice(0);
+    const dim_t width            = 11;
+    const dim_t height           = 9;
+    const dim_t coefficientCount = perspective ? 9 : 6;
+    const dim_t transformCount   = perspective ? 342 : 513;
+
+    std::vector<float> inputValues(width * height);
+    for (dim_t y = 0; y < height; ++y) {
+        for (dim_t x = 0; x < width; ++x) {
+            inputValues[x + y * width] = static_cast<float>(1 + x + y * width);
+        }
+    }
+    af::array input(width, height, inputValues.data());
+
+    std::vector<float> transforms(coefficientCount * transformCount);
+    for (dim_t index = 0; index < transformCount; ++index) {
+        const size_t offset = static_cast<size_t>(coefficientCount * index);
+        const float translateX =
+            static_cast<float>(static_cast<int>(index % 5) - 2);
+        const float translateY =
+            static_cast<float>(static_cast<int>((index / 5) % 5) - 2);
+        transforms[offset + 0] = 1.0f;
+        transforms[offset + 1] = 0.0f;
+        transforms[offset + 2] = translateX;
+        transforms[offset + 3] = 0.0f;
+        transforms[offset + 4] = 1.0f;
+        transforms[offset + 5] = translateY;
+        if (perspective) {
+            transforms[offset + 6] =
+                0.001f * static_cast<float>(static_cast<int>(index % 3) - 1);
+            transforms[offset + 7] =
+                0.001f *
+                static_cast<float>(static_cast<int>((index / 3) % 3) - 1);
+            transforms[offset + 8] = 1.0f;
+        }
+    }
+    af::array transform(af::dim4(3, perspective ? 3 : 2, transformCount),
+                        transforms.data());
+
+    af::array output = af::transform(input, transform, width, height,
+                                     AF_INTERP_NEAREST, false);
+    output.eval();
+    af::sync();
+
+    ASSERT_EQ(af::dim4(width, height, transformCount), output.dims());
+    const std::vector<dim_t> selectedIndices =
+        perspective ? std::vector<dim_t>{0, 1, 170, 340, 341}
+                    : std::vector<dim_t>{0, 1, 255, 511, 512};
+    std::vector<std::vector<float>> selectedOutputs;
+    selectedOutputs.reserve(selectedIndices.size());
+    for (dim_t index : selectedIndices) {
+        const size_t offset = static_cast<size_t>(coefficientCount * index);
+        af::array singleTransform(af::dim4(3, perspective ? 3 : 2),
+                                  transforms.data() + offset);
+        const std::vector<float> reference = host(af::transform(
+            input, singleTransform, width, height, AF_INTERP_NEAREST, false));
+        const std::vector<float> batched =
+            host(output(af::span, af::span, index));
+        const std::string error = mismatch(reference, batched, 0.0f);
+        EXPECT_TRUE(error.empty())
+            << "transform index " << index << ": " << error;
+        selectedOutputs.push_back(batched);
+    }
+
+    for (size_t lhs = 0; lhs < selectedOutputs.size(); ++lhs) {
+        for (size_t rhs = lhs + 1; rhs < selectedOutputs.size(); ++rhs) {
+            EXPECT_TRUE(differs(selectedOutputs[lhs], selectedOutputs[rhs]))
+                << "transform indices " << selectedIndices[lhs] << " and "
+                << selectedIndices[rhs]
+                << " must produce observably distinct outputs";
+        }
+    }
+}
+
 #if defined(AF_TEST_WITH_CUDNN)
+using ArrayOperation = std::function<af::array()>;
+
+size_t index4(const af::dim4 &dims, dim_t x, dim_t y, dim_t z, dim_t w) {
+    return static_cast<size_t>(x + dims[0] * (y + dims[1] * (z + dims[2] * w)));
+}
+
+std::vector<float> hostConvolve2NN(
+    const std::vector<float> &signal, const af::dim4 &signalDims,
+    const std::vector<float> &filter, const af::dim4 &filterDims,
+    const af::dim4 &stride, const af::dim4 &padding, const af::dim4 &dilation) {
+    const dim_t outputWidth = 1 + (signalDims[0] + 2 * padding[0] -
+                                   (((filterDims[0] - 1) * dilation[0]) + 1)) /
+                                      stride[0];
+    const dim_t outputHeight = 1 + (signalDims[1] + 2 * padding[1] -
+                                    (((filterDims[1] - 1) * dilation[1]) + 1)) /
+                                       stride[1];
+    const af::dim4 outputDims(outputWidth, outputHeight, filterDims[3],
+                              signalDims[3]);
+    std::vector<float> output(outputDims.elements(), 0.0f);
+
+    for (dim_t batch = 0; batch < signalDims[3]; ++batch) {
+        for (dim_t outputChannel = 0; outputChannel < filterDims[3];
+             ++outputChannel) {
+            for (dim_t outputY = 0; outputY < outputHeight; ++outputY) {
+                for (dim_t outputX = 0; outputX < outputWidth; ++outputX) {
+                    double sum = 0.0;
+                    for (dim_t inputChannel = 0; inputChannel < signalDims[2];
+                         ++inputChannel) {
+                        for (dim_t filterY = 0; filterY < filterDims[1];
+                             ++filterY) {
+                            const dim_t inputY = outputY * stride[1] +
+                                                 filterY * dilation[1] -
+                                                 padding[1];
+                            if (inputY < 0 || inputY >= signalDims[1]) {
+                                continue;
+                            }
+                            for (dim_t filterX = 0; filterX < filterDims[0];
+                                 ++filterX) {
+                                const dim_t inputX = outputX * stride[0] +
+                                                     filterX * dilation[0] -
+                                                     padding[0];
+                                if (inputX < 0 || inputX >= signalDims[0]) {
+                                    continue;
+                                }
+                                const dim_t flippedX =
+                                    filterDims[0] - 1 - filterX;
+                                const dim_t flippedY =
+                                    filterDims[1] - 1 - filterY;
+                                sum += static_cast<double>(signal[index4(
+                                           signalDims, inputX, inputY,
+                                           inputChannel, batch)]) *
+                                       filter[index4(filterDims, flippedX,
+                                                     flippedY, inputChannel,
+                                                     outputChannel)];
+                            }
+                        }
+                    }
+                    output[index4(outputDims, outputX, outputY, outputChannel,
+                                  batch)] = static_cast<float>(sum);
+                }
+            }
+        }
+    }
+    return output;
+}
+
+std::vector<float> hostConvolve2FilterGradientNN(
+    const std::vector<float> &incomingGradient,
+    const af::dim4 &incomingGradientDims, const std::vector<float> &signal,
+    const af::dim4 &signalDims, const af::dim4 &filterDims,
+    const af::dim4 &stride, const af::dim4 &padding, const af::dim4 &dilation) {
+    std::vector<float> output(filterDims.elements(), 0.0f);
+    for (dim_t outputChannel = 0; outputChannel < filterDims[3];
+         ++outputChannel) {
+        for (dim_t inputChannel = 0; inputChannel < filterDims[2];
+             ++inputChannel) {
+            for (dim_t filterY = 0; filterY < filterDims[1]; ++filterY) {
+                for (dim_t filterX = 0; filterX < filterDims[0]; ++filterX) {
+                    double sum                   = 0.0;
+                    const dim_t unwrappedFilterX = filterDims[0] - 1 - filterX;
+                    const dim_t unwrappedFilterY = filterDims[1] - 1 - filterY;
+                    for (dim_t batch = 0; batch < signalDims[3]; ++batch) {
+                        for (dim_t outputY = 0;
+                             outputY < incomingGradientDims[1]; ++outputY) {
+                            const dim_t inputY =
+                                outputY * stride[1] +
+                                unwrappedFilterY * dilation[1] - padding[1];
+                            if (inputY < 0 || inputY >= signalDims[1]) {
+                                continue;
+                            }
+                            for (dim_t outputX = 0;
+                                 outputX < incomingGradientDims[0]; ++outputX) {
+                                const dim_t inputX =
+                                    outputX * stride[0] +
+                                    unwrappedFilterX * dilation[0] - padding[0];
+                                if (inputX < 0 || inputX >= signalDims[0]) {
+                                    continue;
+                                }
+                                sum += static_cast<double>(signal[index4(
+                                           signalDims, inputX, inputY,
+                                           inputChannel, batch)]) *
+                                       incomingGradient[index4(
+                                           incomingGradientDims, outputX,
+                                           outputY, outputChannel, batch)];
+                            }
+                        }
+                    }
+                    output[index4(filterDims, filterX, filterY, inputChannel,
+                                  outputChannel)] = static_cast<float>(sum);
+                }
+            }
+        }
+    }
+    return output;
+}
+
+void verifyColdConcurrentVariants(const Operation &operation,
+                                  const std::vector<float> &gold0,
+                                  const std::vector<float> &gold1,
+                                  float tolerance, size_t threadCount = 4) {
+    ASSERT_TRUE(differs(gold0, gold1))
+        << "The same-key variants must have distinct host references";
+    StartGate gate(threadCount);
+    std::vector<std::vector<float>> actual(threadCount);
+    std::vector<std::string> errors(threadCount);
+    std::vector<std::thread> threads;
+    threads.reserve(threadCount);
+
+    for (size_t thread = 0; thread < threadCount; ++thread) {
+        threads.emplace_back([&, thread]() {
+            gate.wait();
+            try {
+                af::setDevice(0);
+                actual[thread] = host(operation((thread % 2) != 0));
+            } catch (const std::exception &error) {
+                errors[thread] = error.what();
+            }
+        });
+    }
+    for (std::thread &thread : threads) { thread.join(); }
+    for (size_t thread = 0; thread < threadCount; ++thread) {
+        ASSERT_TRUE(errors[thread].empty())
+            << "thread " << thread << ": " << errors[thread];
+    }
+
+    for (size_t thread = 0; thread < threadCount; ++thread) {
+        const std::vector<float> &gold = (thread % 2) != 0 ? gold1 : gold0;
+        EXPECT_TRUE(mismatch(gold, actual[thread], tolerance).empty())
+            << "thread " << thread;
+    }
+}
+
+void verifyColdConcurrentOperations(
+    const std::vector<ArrayOperation> &operations,
+    const std::vector<std::vector<float>> &gold, float tolerance) {
+    ASSERT_GE(operations.size(), 2U);
+    ASSERT_EQ(operations.size(), gold.size());
+    StartGate gate(operations.size());
+    std::vector<std::vector<float>> actual(operations.size());
+    std::vector<std::string> errors(operations.size());
+    std::vector<std::thread> threads;
+    threads.reserve(operations.size());
+
+    for (size_t thread = 0; thread < operations.size(); ++thread) {
+        threads.emplace_back([&, thread]() {
+            gate.wait();
+            try {
+                af::setDevice(0);
+                actual[thread] = host(operations[thread]());
+            } catch (const std::exception &error) {
+                errors[thread] = error.what();
+            }
+        });
+    }
+    for (std::thread &thread : threads) { thread.join(); }
+
+    af::setDevice(0);
+    for (size_t thread = 0; thread < operations.size(); ++thread) {
+        ASSERT_TRUE(errors[thread].empty())
+            << "thread " << thread << ": " << errors[thread];
+        EXPECT_TRUE(mismatch(gold[thread], actual[thread], tolerance).empty())
+            << "thread " << thread;
+    }
+}
+
 std::vector<float> runConvolveNN() {
     af::setDevice(0);
     af::array signal = af::range(af::dim4(8, 8, 1, 1), 0, f32);
@@ -374,8 +810,8 @@ TEST(CUDNNAlgorithmCache, RepeatedForwardAndBackwardFilterShapesStayAccurate) {
 
     af::array incomingGradient = af::randu(forward0.dims(), f32);
     af::array filterGradient0  = af::convolve2GradientNN(
-         incomingGradient, signal, filter, forward0, stride, padding, dilation,
-         AF_CONV_GRADIENT_FILTER);
+        incomingGradient, signal, filter, forward0, stride, padding, dilation,
+        AF_CONV_GRADIENT_FILTER);
     af::array filterGradient1 = af::convolve2GradientNN(
         incomingGradient.copy(), signal.copy(), filter.copy(), forward1, stride,
         padding, dilation, AF_CONV_GRADIENT_FILTER);
@@ -383,6 +819,163 @@ TEST(CUDNNAlgorithmCache, RepeatedForwardAndBackwardFilterShapesStayAccurate) {
     filterGradient1.eval();
     af::sync();
     ASSERT_ARRAYS_NEAR(filterGradient0, filterGradient1, 4.0e-3);
+}
+
+TEST(CUDNNAlgorithmCache, ConcurrentSameKeyForwardSelectionStaysAccurate) {
+    af::setDevice(0);
+    const af::dim4 signalDims(19, 17, 2, 1);
+    const af::dim4 filterDims(3, 3, 2, 3);
+    std::vector<float> signalValues(signalDims.elements());
+    for (size_t index = 0; index < signalValues.size(); ++index) {
+        signalValues[index] = static_cast<float>((index % 31) + 1) / 32.0f;
+    }
+    const std::vector<float> filter0Values(filterDims.elements(), 1.0f / 16.0f);
+    const std::vector<float> filter1Values(filterDims.elements(),
+                                           -1.0f / 32.0f);
+    af::array signal(signalDims, signalValues.data());
+    af::array filter0(filterDims, filter0Values.data());
+    af::array filter1(filterDims, filter1Values.data());
+    signal.eval();
+    filter0.eval();
+    filter1.eval();
+    af::sync();
+    const af::dim4 stride(1, 1);
+    const af::dim4 padding(1, 1);
+    const af::dim4 dilation(1, 1);
+
+    Operation operation = [signal, filter0, filter1, stride, padding,
+                           dilation](bool variant) {
+        const af::array &filter = variant ? filter1 : filter0;
+        return af::convolve2NN(signal, filter, stride, padding, dilation);
+    };
+    const std::vector<float> gold0 =
+        hostConvolve2NN(signalValues, signalDims, filter0Values, filterDims,
+                        stride, padding, dilation);
+    const std::vector<float> gold1 =
+        hostConvolve2NN(signalValues, signalDims, filter1Values, filterDims,
+                        stride, padding, dilation);
+    verifyColdConcurrentVariants(operation, gold0, gold1, 1.0e-4f);
+}
+
+TEST(CUDNNAlgorithmCache, ConcurrentDifferentKeyForwardSelectionsStayAccurate) {
+    af::setDevice(0);
+    const af::dim4 stride(1, 1);
+    const af::dim4 padding(1, 1);
+    const af::dim4 dilation(1, 1);
+    std::vector<ArrayOperation> operations;
+    std::vector<std::vector<float>> gold;
+    for (dim_t variant = 0; variant < 3; ++variant) {
+        const dim_t width  = 23 + variant;
+        const dim_t height = 12 + variant;
+        const af::dim4 signalDims(width, height, 2, 1);
+        const af::dim4 filterDims(3, 3, 2, 3);
+        const std::vector<float> signalValues(
+            signalDims.elements(), static_cast<float>(variant + 1) / 32.0f);
+        const std::vector<float> filterValues(
+            filterDims.elements(), static_cast<float>(variant + 2) / 64.0f);
+        af::array signal(signalDims, signalValues.data());
+        af::array filter(filterDims, filterValues.data());
+        signal.eval();
+        filter.eval();
+        gold.push_back(hostConvolve2NN(signalValues, signalDims, filterValues,
+                                       filterDims, stride, padding, dilation));
+        operations.emplace_back([signal, filter, stride, padding, dilation]() {
+            return af::convolve2NN(signal, filter, stride, padding, dilation);
+        });
+    }
+    af::sync();
+    verifyColdConcurrentOperations(operations, gold, 1.0e-4f);
+}
+
+TEST(CUDNNAlgorithmCache,
+     ConcurrentSameKeyBackwardFilterSelectionStaysAccurate) {
+    af::setDevice(0);
+    const af::dim4 signalDims(18, 15, 2, 1);
+    const af::dim4 filterDims(3, 3, 2, 3);
+    const af::dim4 gradientDims(18, 15, 3, 1);
+    std::vector<float> signalValues(signalDims.elements());
+    for (size_t index = 0; index < signalValues.size(); ++index) {
+        signalValues[index] = static_cast<float>((index % 29) + 1) / 64.0f;
+    }
+    const std::vector<float> filterValues(filterDims.elements(), 1.0f / 16.0f);
+    const std::vector<float> convolvedValues(gradientDims.elements(), 0.0f);
+    const std::vector<float> gradient0Values(gradientDims.elements(),
+                                             1.0f / 1024.0f);
+    const std::vector<float> gradient1Values(gradientDims.elements(),
+                                             -1.0f / 2048.0f);
+    af::array signal(signalDims, signalValues.data());
+    af::array filter(filterDims, filterValues.data());
+    af::array convolvedOutput(gradientDims, convolvedValues.data());
+    af::array gradient0(gradientDims, gradient0Values.data());
+    af::array gradient1(gradientDims, gradient1Values.data());
+    signal.eval();
+    filter.eval();
+    convolvedOutput.eval();
+    gradient0.eval();
+    gradient1.eval();
+    af::sync();
+    const af::dim4 stride(1, 1);
+    const af::dim4 padding(1, 1);
+    const af::dim4 dilation(1, 1);
+
+    Operation operation = [signal, filter, convolvedOutput, gradient0,
+                           gradient1, stride, padding, dilation](bool variant) {
+        const af::array &incomingGradient = variant ? gradient1 : gradient0;
+        return af::convolve2GradientNN(incomingGradient, signal, filter,
+                                       convolvedOutput, stride, padding,
+                                       dilation, AF_CONV_GRADIENT_FILTER);
+    };
+    const std::vector<float> gold0 = hostConvolve2FilterGradientNN(
+        gradient0Values, gradientDims, signalValues, signalDims, filterDims,
+        stride, padding, dilation);
+    const std::vector<float> gold1 = hostConvolve2FilterGradientNN(
+        gradient1Values, gradientDims, signalValues, signalDims, filterDims,
+        stride, padding, dilation);
+    verifyColdConcurrentVariants(operation, gold0, gold1, 4.0e-3f);
+}
+
+TEST(CUDNNAlgorithmCache,
+     ConcurrentDifferentKeyBackwardFilterSelectionsStayAccurate) {
+    af::setDevice(0);
+    const af::dim4 stride(1, 1);
+    const af::dim4 padding(1, 1);
+    const af::dim4 dilation(1, 1);
+    std::vector<ArrayOperation> operations;
+    std::vector<std::vector<float>> gold;
+    for (dim_t variant = 0; variant < 3; ++variant) {
+        const dim_t width  = 27 + variant;
+        const dim_t height = 14 + variant;
+        const af::dim4 signalDims(width, height, 2, 1);
+        const af::dim4 filterDims(3, 3, 2, 3);
+        const af::dim4 gradientDims(width, height, 3, 1);
+        const std::vector<float> signalValues(
+            signalDims.elements(), static_cast<float>(variant + 1) / 64.0f);
+        const std::vector<float> filterValues(filterDims.elements(),
+                                              1.0f / 16.0f);
+        const std::vector<float> convolvedValues(gradientDims.elements(), 0.0f);
+        const std::vector<float> incomingGradientValues(
+            gradientDims.elements(), static_cast<float>(variant + 1) / 1024.0f);
+        af::array signal(signalDims, signalValues.data());
+        af::array filter(filterDims, filterValues.data());
+        af::array convolvedOutput(gradientDims, convolvedValues.data());
+        af::array incomingGradient(gradientDims, incomingGradientValues.data());
+        signal.eval();
+        filter.eval();
+        convolvedOutput.eval();
+        incomingGradient.eval();
+        gold.push_back(hostConvolve2FilterGradientNN(
+            incomingGradientValues, gradientDims, signalValues, signalDims,
+            filterDims, stride, padding, dilation));
+        operations.emplace_back([signal, filter, convolvedOutput,
+                                 incomingGradient, stride, padding,
+                                 dilation]() {
+            return af::convolve2GradientNN(incomingGradient, signal, filter,
+                                           convolvedOutput, stride, padding,
+                                           dilation, AF_CONV_GRADIENT_FILTER);
+        });
+    }
+    af::sync();
+    verifyColdConcurrentOperations(operations, gold, 4.0e-3f);
 }
 #endif
 
@@ -554,30 +1147,11 @@ TEST(CUDASharedState, ConcurrentTransformUsesPerCallMatrix) {
 }
 
 TEST(CUDASharedState, TransformSupportsMoreThanConstantMemoryBatch) {
-    af::setDevice(0);
-    const dim_t transformCount = 513;
-    af::array input            = af::randu(8, 8, f32);
-    std::vector<float> transforms(6 * transformCount);
-    for (dim_t i = 0; i < transformCount; ++i) {
-        transforms[6 * i + 0] = 1.0f;
-        transforms[6 * i + 1] = 0.0f;
-        transforms[6 * i + 2] = 0.0f;
-        transforms[6 * i + 3] = 0.0f;
-        transforms[6 * i + 4] = 1.0f;
-        transforms[6 * i + 5] = 0.0f;
-    }
-    af::array transform(af::dim4(3, 2, transformCount), transforms.data());
+    verifyTransformBatchBeyondLegacyConstantMemory(false);
+}
 
-    af::array output =
-        af::transform(input, transform, 8, 8, AF_INTERP_NEAREST, false);
-    output.eval();
-    af::sync();
-
-    EXPECT_EQ(af::dim4(8, 8, transformCount), output.dims());
-    const std::vector<float> first = host(output(af::span, af::span, 0));
-    const std::vector<float> last =
-        host(output(af::span, af::span, transformCount - 1));
-    EXPECT_EQ(first, last);
+TEST(CUDASharedState, PerspectiveTransformSupportsMoreThanConstantMemoryBatch) {
+    verifyTransformBatchBeyondLegacyConstantMemory(true);
 }
 
 TEST(CUDASharedState, ConcurrentCannyUsesPerCallConvergenceFlag) {

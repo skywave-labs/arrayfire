@@ -11,19 +11,32 @@ files are available, `cuda_backend_cuda` records:
 - changes in ArrayFire's allocated and locked memory-pool state.
 
 The suite covers contiguous and gapped JIT expressions, dimensional reduction,
-matrix multiplication, long-line batched sorting, short and medium segmented
-value/index/key-value sorting, nonzero-dimension sorting with reorder cost, the
-iterative-sort fallback, 2-D/3-D spatial convolution, cuDNN NN forward/backward
-filter convolution, 2-D/3-D morphology, and image transforms. The 3-D and NN
-cases derive bounded dimensions from `--size` so the default run remains
-practical. Run every case with:
+standard and batched matrix multiplication, long-line batched sorting, short
+and medium segmented value/index/key-value sorting, nonzero-dimension sorting
+with reorder cost, the iterative-sort fallback, 1-D and 2-D/3-D spatial
+convolution, separable convolution, cuDNN NN forward/backward-filter
+convolution, 2-D/3-D morphology, and affine and perspective image transforms.
+The 3-D and NN cases derive bounded dimensions from `--size` so the default run
+remains practical.
+
+A focused preset configures a CUDA-only build and compiles just this benchmark:
 
 ```sh
-./cuda_backend_cuda --device 0 --size 2048 --iterations 20
+cmake --preset ninja-cuda-benchmark-relwithdebinfo
+cmake --build --preset ninja-cuda-benchmark-relwithdebinfo
+```
+
+Run every case with:
+
+```sh
+./build/ninja-cuda-benchmark-relwithdebinfo/examples/benchmarks/cuda_backend_cuda \
+  --device 0 --size 2048 --iterations 20
 ```
 
 Use `--case NAME` to isolate a row and `--help` to list the case names. Output
-is CSV so results from two revisions can be compared directly.
+is CSV so results from two revisions can be compared directly. Automated
+performance checks should compare revisions on an otherwise idle GPU rather
+than enforce fixed absolute time limits.
 
 The `cudnn_forward_3x3` and `cudnn_backward_filter_3x3` rows initialize the
 plugin and handle with a different descriptor first. Their `first_call_ms`

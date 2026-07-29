@@ -16,7 +16,9 @@ add_test(
   COMMAND
     ${CMAKE_COMMAND}
     -P ${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/select_compute_arch_test.cmake)
-set_tests_properties(cmake_cuda_architectures PROPERTIES LABELS "cmake;cuda")
+set_tests_properties(
+  cmake_cuda_architectures
+  PROPERTIES LABELS "cmake;cuda;config;no-gpu")
 
 if(AF_CTEST_SEPARATED)
   include(GoogleTest)
@@ -69,6 +71,15 @@ if(NOT TARGET mmio)
 endif()
 
 
+# Returns the labels shared by tests for a backend.
+function(af_backend_test_labels output backend)
+  set(labels runtime ${backend})
+  if("${backend}" STREQUAL "cuda")
+    list(APPEND labels gpu)
+  endif()
+  set(${output} "${labels}" PARENT_SCOPE)
+endfunction()
+
 # Registers test with ctest
 #
 # Parameters
@@ -76,19 +87,45 @@ endif()
 #  backend: The backend associated with this test
 #  is_serial: If true the test will be serialized
 function(af_add_test target backend is_serial)
+  af_backend_test_labels(test_labels ${backend})
   if(AF_CTEST_SEPARATED)
-    gtest_discover_tests(${target}
-      TEST_PREFIX $<UPPER_CASE:${backend}>.
-      DISCOVERY_TIMEOUT 40)
+    if(is_serial)
+      gtest_discover_tests(${target}
+        TEST_PREFIX $<UPPER_CASE:${backend}>.
+        PROPERTIES
+          ENVIRONMENT AF_PRINT_ERRORS=1
+          TIMEOUT 900
+          RUN_SERIAL ON
+        DISCOVERY_TIMEOUT 40)
+    else()
+      gtest_discover_tests(${target}
+        TEST_PREFIX $<UPPER_CASE:${backend}>.
+        DISCOVERY_TIMEOUT 40)
+    endif()
+
+    # Discovered tests do not exist at configure time. Apply their list-valued
+    # labels from a CTest include after GoogleTest has populated target_TESTS.
+    set(test_labels_file
+      "${CMAKE_CURRENT_BINARY_DIR}/${target}_labels.cmake")
+    file(GENERATE
+      OUTPUT "${test_labels_file}"
+      CONTENT
+"foreach(test_name IN LISTS ${target}_TESTS)
+  set_property(TEST \"\${test_name}\" APPEND PROPERTY LABELS \"${test_labels}\")
+endforeach()
+")
+    set_property(
+      DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES "${test_labels_file}")
   else()
     add_test(NAME ${target} COMMAND ${target})
-    if(${is_serial})
+    set_tests_properties(${target} PROPERTIES LABELS "${test_labels}")
+    if(is_serial)
       set_tests_properties(${target}
         PROPERTIES
           ENVIRONMENT AF_PRINT_ERRORS=1
           TIMEOUT 900
           RUN_SERIAL ON)
-    endif(${is_serial})
+    endif()
   endif()
 endfunction()
 
@@ -325,6 +362,22 @@ if(AF_BUILD_CUDA)
   set_target_properties(
     test_cuda_shared_state_cuda
     PROPERTIES CXX_STANDARD 14)
+  if(AF_WITH_CUDNN AND AF_WITH_LOGGING)
+    add_test(
+      NAME cuda_cudnn_algorithm_cache_runtime
+      COMMAND
+        ${CMAKE_COMMAND}
+        "-DTEST_EXECUTABLE=$<TARGET_FILE:test_cuda_shared_state_cuda>"
+        -P
+        ${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/cuda_cudnn_algorithm_cache_runtime_test.cmake)
+    set_tests_properties(
+      cuda_cudnn_algorithm_cache_runtime
+      PROPERTIES
+        LABELS "runtime;cuda;gpu;cudnn;cache"
+        RUN_SERIAL ON
+        SKIP_REGULAR_EXPRESSION "AF_TEST_SKIP_CUDNN_RUNTIME_UNAVAILABLE"
+        TIMEOUT 360)
+  endif()
 endif()
 make_test(SRC diagonal.cpp)
 make_test(SRC diff1.cpp)
@@ -406,6 +459,36 @@ endif()
 
 if(AF_BUILD_CUDA)
   if(CUDA_FOUND)
+    if(AF_CACHE_KERNELS_TO_DISK AND AF_WITH_LOGGING)
+      add_executable(
+        test_cuda_kernel_cache_helper
+        cuda_kernel_cache_helper.cpp)
+      target_link_libraries(
+        test_cuda_kernel_cache_helper
+        PRIVATE ArrayFire::afcuda)
+      set_target_properties(
+        test_cuda_kernel_cache_helper
+        PROPERTIES
+          CXX_STANDARD 11
+          FOLDER "Tests"
+          OUTPUT_NAME "cuda_kernel_cache_helper")
+
+      add_test(
+        NAME cuda_kernel_cache_roundtrip
+        COMMAND
+          ${CMAKE_COMMAND}
+          "-DHELPER_EXECUTABLE=$<TARGET_FILE:test_cuda_kernel_cache_helper>"
+          "-DROUNDTRIP_ROOT=${CMAKE_CURRENT_BINARY_DIR}"
+          -P
+          ${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/cuda_kernel_cache_roundtrip_test.cmake)
+      set_tests_properties(
+        cuda_kernel_cache_roundtrip
+        PROPERTIES
+          LABELS "runtime;cuda;gpu;cache"
+          RUN_SERIAL ON
+          TIMEOUT 180)
+    endif()
+
     include(AFcuda_helpers)
     foreach(backend ${enabled_backends})
       set(cuda_test_backends "cuda" "unified")
@@ -522,6 +605,8 @@ foreach(backend ${enabled_backends})
       ArrayFire::af${backend})
   endif()
   add_test(NAME ${target} COMMAND ${target})
+  af_backend_test_labels(test_labels ${backend})
+  set_tests_properties(${target} PROPERTIES LABELS "${test_labels}")
 endforeach()
 
 if(AF_TEST_WITH_MTX_FILES)

@@ -80,6 +80,63 @@ void solveTester(const int m, const int n, const int k, const int b, double eps,
         eps);
 }
 
+#if defined(AF_CUDA)
+template<typename T>
+void solveFourDimensionalBatchGridTailTester(double tolerance) {
+    deviceGC();
+
+    SUPPORTED_TYPE_CHECK(T);
+    LAPACK_ENABLED_CHECK();
+
+    // CUDA builds the batched pointer arrays with 256 threads per block.
+    // Unequal batch dimensions exercise both strides without allowing a z/w
+    // swap to become an output-preserving permutation. The 272 batches leave
+    // a 16-entry tail in the second pointer-setup block.
+    const dim_t n      = 4;
+    const dim_t nrhs   = 2;
+    const dim_t batchZ = 17;
+    const dim_t batchW = 16;
+    const dim4 matrixDims(n, n, batchZ, batchW);
+    const dim4 solutionDims(n, nrhs, batchZ, batchW);
+
+    vector<T> matrices(matrixDims.elements(), T(0));
+    vector<T> rhs(solutionDims.elements(), T(0));
+    vector<T> expected(solutionDims.elements(), T(0));
+
+    using Base = typename dtype_traits<T>::base_type;
+    for (dim_t w = 0; w < batchW; ++w) {
+        for (dim_t z = 0; z < batchZ; ++z) {
+            const dim_t batch = z + batchZ * w;
+            for (dim_t row = 0; row < n; ++row) {
+                const Base diagonalValue = Base(2) +
+                                           Base(batch + 1) / Base(1024) +
+                                           Base(row + 1) / Base(16);
+                const T diagonal(diagonalValue);
+                const dim_t matrixOffset = batch * n * n + row + row * n;
+                matrices[matrixOffset]   = diagonal;
+
+                for (dim_t column = 0; column < nrhs; ++column) {
+                    const Base solutionValue =
+                        Base(0.25) + Base(batch + 1) / Base(512) +
+                        Base(row + 1) / Base(32) + Base(column + 1) / Base(64);
+                    const dim_t solutionOffset =
+                        batch * n * nrhs + row + column * n;
+                    expected[solutionOffset] = T(solutionValue);
+                    rhs[solutionOffset] = diagonal * expected[solutionOffset];
+                }
+            }
+        }
+    }
+
+    array A(matrixDims, matrices.data());
+    array B(solutionDims, rhs.data());
+    array expectedSolution(solutionDims, expected.data());
+    array actualSolution = solve(A, B);
+
+    ASSERT_ARRAYS_NEAR(expectedSolution, actualSolution, tolerance);
+}
+#endif
+
 template<typename T>
 void solveLUTester(const int n, const int k, double eps,
                    int targetDevice = -1) {
@@ -222,6 +279,12 @@ TYPED_TEST(Solve, SquareBatch) {
 TYPED_TEST(Solve, SquareMultipleOfTwoBatch) {
     solveTester<TypeParam>(96, 96, 16, 10, eps<TypeParam>());
 }
+
+#if defined(AF_CUDA)
+TYPED_TEST(Solve, SquareFourDimensionalBatchGridTail) {
+    solveFourDimensionalBatchGridTailTester<TypeParam>(eps<TypeParam>());
+}
+#endif
 
 TYPED_TEST(Solve, SquareLargeBatch) {
     solveTester<TypeParam>(1000, 1000, 10, 10, eps<TypeParam>());

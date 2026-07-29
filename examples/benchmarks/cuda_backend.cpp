@@ -421,6 +421,40 @@ void runConvolution(const Options &options, cudaStream_t stream) {
                  measure(work, options.iterations, stream));
 }
 
+void runOneDimensionalConvolution(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "convolve1_9")) { return; }
+
+    af::deviceGC();
+    af::array signal = af::randu(options.size * options.size, f32);
+    af::array filter = af::constant(1.0f, 9, f32) / 9.0f;
+    materialize(signal);
+    materialize(filter);
+
+    Work work = [signal, filter]() {
+        return af::convolve1(signal, filter, AF_CONV_DEFAULT, AF_CONV_SPATIAL);
+    };
+    printMetrics("convolve1_9", options,
+                 measure(work, options.iterations, stream));
+}
+
+void runSeparableConvolution(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "convolve2_separable_7x7")) { return; }
+
+    af::deviceGC();
+    af::array signal = af::randu(options.size, options.size, f32);
+    af::array column = af::constant(1.0f, 7, f32) / 7.0f;
+    af::array row    = af::constant(1.0f, 7, f32) / 7.0f;
+    materialize(signal);
+    materialize(column);
+    materialize(row);
+
+    Work work = [signal, column, row]() {
+        return af::convolve(column, row, signal, AF_CONV_DEFAULT);
+    };
+    printMetrics("convolve2_separable_7x7", options,
+                 measure(work, options.iterations, stream));
+}
+
 void runCudnnForward(const Options &options, cudaStream_t stream) {
     if (!selected(options, "cudnn_forward_3x3")) { return; }
 
@@ -550,6 +584,25 @@ void runTransform(const Options &options, cudaStream_t stream) {
                  measure(work, options.iterations, stream));
 }
 
+void runPerspectiveTransform(const Options &options, cudaStream_t stream) {
+    if (!selected(options, "transform_perspective_bilinear")) { return; }
+
+    af::deviceGC();
+    af::array input               = af::randu(options.size, options.size, f32);
+    const float transformValues[] = {1.0f, 0.0f,  0.25f,    0.0f, 1.0f,
+                                     0.5f, 1e-5f, -5.0e-6f, 1.0f};
+    af::array transform(3, 3, transformValues);
+    materialize(input);
+    materialize(transform);
+
+    Work work = [input, transform, options]() {
+        return af::transform(input, transform, options.size, options.size,
+                             AF_INTERP_BILINEAR, false);
+    };
+    printMetrics("transform_perspective_bilinear", options,
+                 measure(work, options.iterations, stream));
+}
+
 Options parseOptions(int argc, char **argv) {
     Options options;
     for (int i = 1; i < argc; ++i) {
@@ -571,10 +624,12 @@ Options parseOptions(int argc, char **argv) {
                          "sort_batched, sort_values_32, sort_values_32_dim1, "
                          "sort_index_32, sort_by_key_32, sort_index_256, "
                          "sort_by_key_256, sort_values_iterative_10, "
-                         "convolve2_7x7, dilate_7x7, "
+                         "convolve1_9, convolve2_7x7, "
+                         "convolve2_separable_7x7, dilate_7x7, "
                          "cudnn_forward_3x3, cudnn_backward_filter_3x3, "
                          "convolve3_5x5_c64, dilate3_7x7_f64, "
-                         "transform_bilinear\n";
+                         "transform_bilinear, "
+                         "transform_perspective_bilinear\n";
             std::exit(0);
         } else {
             throw std::invalid_argument("Unknown or incomplete argument: " +
@@ -628,13 +683,16 @@ int main(int argc, char **argv) {
         runShortSegmentSorts(options, stream);
         runMediumSegmentSorts(options, stream);
         runIterativeSort(options, stream);
+        runOneDimensionalConvolution(options, stream);
         runConvolution(options, stream);
+        runSeparableConvolution(options, stream);
         runCudnnForward(options, stream);
         runCudnnBackwardFilter(options, stream);
         runVolumeConvolution(options, stream);
         runMorphology(options, stream);
         runVolumeMorphology(options, stream);
         runTransform(options, stream);
+        runPerspectiveTransform(options, stream);
         af::sync();
         return 0;
     } catch (const af::exception &error) {
