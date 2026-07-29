@@ -20,17 +20,40 @@ namespace cuda {
 struct ThrustArrayFirePolicy
     : thrust::cuda::execution_policy<ThrustArrayFirePolicy> {};
 
+// This policy is restricted to algorithms whose results stay on ArrayFire's
+// single ordered stream for the device. That ordering also makes immediate
+// scratch-buffer reclamation safe. Call sites must retain POST_LAUNCH_CHECK
+// after the Thrust operation; a multi-stream backend will need event-fenced
+// scratch reclamation before it can use this policy.
+struct ThrustArrayFireNoSyncPolicy
+    : thrust::cuda::execution_policy<ThrustArrayFireNoSyncPolicy> {};
+
 template<typename T>
 thrust::pair<thrust::pointer<T, ThrustArrayFirePolicy>, std::ptrdiff_t>
 get_temporary_buffer(ThrustArrayFirePolicy, std::ptrdiff_t n) {
+    // Thrust specifies n as a count of T objects, not a byte count.
     thrust::pointer<T, ThrustArrayFirePolicy> result(
-        arrayfire::cuda::memAlloc<T>(n / sizeof(T)).release());
+        arrayfire::cuda::memAlloc<T>(n).release());
+
+    return thrust::make_pair(result, n);
+}
+
+template<typename T>
+thrust::pair<thrust::pointer<T, ThrustArrayFireNoSyncPolicy>, std::ptrdiff_t>
+get_temporary_buffer(ThrustArrayFireNoSyncPolicy, std::ptrdiff_t n) {
+    thrust::pointer<T, ThrustArrayFireNoSyncPolicy> result(
+        arrayfire::cuda::memAlloc<T>(n).release());
 
     return thrust::make_pair(result, n);
 }
 
 template<typename Pointer>
 inline void return_temporary_buffer(ThrustArrayFirePolicy, Pointer p) {
+    memFree(thrust::raw_pointer_cast(p));
+}
+
+template<typename Pointer>
+inline void return_temporary_buffer(ThrustArrayFireNoSyncPolicy, Pointer p) {
     memFree(thrust::raw_pointer_cast(p));
 }
 
@@ -53,6 +76,17 @@ __DH__ inline cudaStream_t get_stream<arrayfire::cuda::ThrustArrayFirePolicy>(
 #endif
 }
 
+template<>
+__DH__ inline cudaStream_t
+get_stream<arrayfire::cuda::ThrustArrayFireNoSyncPolicy>(
+    execution_policy<arrayfire::cuda::ThrustArrayFireNoSyncPolicy> &) {
+#if defined(__CUDA_ARCH__)
+    return 0;
+#else
+    return arrayfire::cuda::getActiveStream();
+#endif
+}
+
 __DH__
 inline cudaError_t synchronize_stream(
     const arrayfire::cuda::ThrustArrayFirePolicy &) {
@@ -61,6 +95,12 @@ inline cudaError_t synchronize_stream(
 #else
     return cudaStreamSynchronize(arrayfire::cuda::getActiveStream());
 #endif
+}
+
+__DH__
+inline cudaError_t synchronize_stream(
+    const arrayfire::cuda::ThrustArrayFireNoSyncPolicy &) {
+    return cudaSuccess;
 }
 
 }  // namespace cuda_cub

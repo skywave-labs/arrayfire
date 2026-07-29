@@ -10,6 +10,7 @@
 #include <Array.hpp>
 #include <copy.hpp>
 #include <err_cuda.hpp>
+#include <kernel/segmented_sort.hpp>
 #include <kernel/sort_by_key.hpp>
 #include <math.hpp>
 #include <range.hpp>
@@ -22,6 +23,27 @@ namespace cuda {
 template<typename T>
 void sort_index(Array<T> &okey, Array<uint> &oval, const Array<T> &in,
                 const uint dim, bool isAscending) {
+    if (kernel::useSegmentedSort(in.dims(), dim, true)) {
+        {
+            Array<T> ordered =
+                dim == 0
+                    ? (in.isReady() && in.isLinear() ? in : copyArray<T>(in))
+                    : reorder<T>(in, kernel::sortPreorder(dim));
+            okey = createEmptyArray<T>(ordered.dims());
+            oval = createEmptyArray<uint>(ordered.dims());
+            kernel::segmentedSortPairs(okey.get(), oval.get(), ordered.get(),
+                                       static_cast<int>(ordered.elements()),
+                                       static_cast<int>(ordered.dims()[0]),
+                                       isAscending);
+        }
+
+        if (dim != 0) {
+            okey = reorder<T>(okey, kernel::sortPostorder(dim));
+            oval = reorder<uint>(oval, kernel::sortPostorder(dim));
+        }
+        return;
+    }
+
     okey = copyArray<T>(in);
     oval = range<uint>(in.dims(), dim);
 

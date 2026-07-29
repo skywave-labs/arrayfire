@@ -32,12 +32,12 @@ void sort0Iterative(Param<T> val, bool isAscending) {
                 int valOffset = valWZ + y * val.strides[1];
 
                 if (isAscending) {
-                    THRUST_SELECT(thrust::sort, val.ptr + valOffset,
-                                  val.ptr + valOffset + val.dims[0]);
+                    THRUST_SELECT_NOSYNC(thrust::sort, val.ptr + valOffset,
+                                         val.ptr + valOffset + val.dims[0]);
                 } else {
-                    THRUST_SELECT(thrust::sort, val.ptr + valOffset,
-                                  val.ptr + valOffset + val.dims[0],
-                                  thrust::greater<T>());
+                    THRUST_SELECT_NOSYNC(thrust::sort, val.ptr + valOffset,
+                                         val.ptr + valOffset + val.dims[0],
+                                         thrust::greater<T>());
                 }
             }
         }
