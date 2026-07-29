@@ -41,14 +41,17 @@ than enforce fixed absolute time limits.
 
 The `reduce_jit_dim0` and `reduce_jit_all` rows consume the same lazy
 trigonometric expression as their `_materialized` controls. Comparing each
-pair measures the end-to-end effect of consuming the producer directly,
-including the avoided allocation, launch, global write, and global read. The
-`reduce_jit_reuse` pair measures the opposite tradeoff: a named lazy expression
-used by two reductions can be recomputed by consumer fusion, while the
-materialized control produces it once. These eligible cases use at least
-256×256 elements even when a smaller `--size` is requested. The
-`reduce_jit_short_dim0` and `reduce_jit_gapped` rows exercise the protected
-short-line and non-linear fallbacks. Run each row in a separate process with
+pair measures the end-to-end effect of consuming the producer directly.
+Whole-array fusion retains the materialized producer for later consumers,
+removing a separate producer launch and the reduction's global read without
+recomputing named expressions. The `reduce_jit_all_reuse4` pair verifies this
+with four consumers. The fixed f64 affine/complex/deep rows cover low-occupancy
+expressions, and the `32768x2` pair protects the dimensional fallback that
+avoids both warm and cold-start regressions.
+
+The size-driven cases use at least 256×256 elements even when a smaller
+`--size` is requested. `reduce_jit_short_dim0` and `reduce_jit_gapped` cover
+additional protected fallbacks. Run each row in a separate process with
 `--case NAME` when comparing cold compilation; an `all` run shares the JIT
 module cache across rows.
 

@@ -29,9 +29,11 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdint>
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace arrayfire {
@@ -40,13 +42,12 @@ namespace kernel {
 namespace jit_reduce_detail {
 
 constexpr dim_t minimum_elements         = 1 << 16;
-constexpr dim_t minimum_reduced_elements = 64;
 constexpr size_t maximum_parameter_bytes = 4096 - 256;
 
-// Start with the common, order-preserving slice whose producer can be indexed
-// linearly. Other operations, types, dimensions, and expression layouts keep
-// the established materialize-then-reduce path until native measurements
-// justify broadening this dispatch.
+// Start with whole-array floating-point sums whose producers can be indexed
+// linearly. Other operations, types, dimensional reductions, and expression
+// layouts keep the established materialize-then-reduce path until native
+// measurements justify broadening this dispatch.
 template<typename Ti, typename To, af_op_t op>
 struct is_supported
     : std::integral_constant<bool, op == af_add_t &&
@@ -79,9 +80,9 @@ using ComputeT = OutputT;
 extern "C" __global__ void )JIT"
            << function_name << "(\n"
            << consumer.parameterDeclarations() << R"JIT(
-    Param<OutputT> partial, int dim0, int dim1, int dim2, int dim3,
-    uint blocks_x, uint blocks_y, uint repeat, bool reduce_all,
-    bool change_nan, OutputT nanval) {
+    Param<InputT> materialized, Param<OutputT> partial,
+    int dim0, int dim1, int dim2, int dim3, uint blocks_x, uint blocks_y,
+    uint repeat, bool change_nan, OutputT nanval) {
     const uint tidx = threadIdx.x;
     const uint tidy = threadIdx.y;
     const uint tid = tidy * blockDim.x + tidx;
@@ -116,8 +117,10 @@ extern "C" __global__ void )JIT"
                             dim2 * static_cast<int>(wid)));
 )JIT" << consumer.offsetsAndOperations()
            << R"JIT(
-        ComputeT value = static_cast<ComputeT>(val)JIT"
+        InputT produced = static_cast<InputT>(val)JIT"
            << consumer.outputId() << R"JIT();
+        materialized.ptr[idx] = produced;
+        ComputeT value = static_cast<ComputeT>(produced);
         if (change_nan) {
             value = value == value ? value : static_cast<ComputeT>(nanval);
         }
@@ -126,60 +129,29 @@ extern "C" __global__ void )JIT"
 
     __shared__ ComputeT values[)JIT"
            << THREADS_PER_BLOCK << R"JIT(];
-    if (reduce_all) {
-        const uint lane_id = tid & 31;
-        const uint warp_id = tid / 32;
-        ComputeT warp_value = reduced;
+    const uint lane_id = tid & 31;
+    const uint warp_id = tid / 32;
+    ComputeT warp_value = reduced;
+    for (uint offset = 16; offset > 0; offset /= 2) {
+        warp_value =
+            warp_value +
+            __shfl_down_sync(0xffffffffu, warp_value, offset);
+    }
+
+    if (lane_id == 0) { values[warp_id] = warp_value; }
+    __syncthreads();
+
+    if (tid < 32) {
+        ComputeT block_value =
+            tid < blockDim.x / 32
+                ? values[tid]
+                : static_cast<ComputeT>(0);
         for (uint offset = 16; offset > 0; offset /= 2) {
-            warp_value =
-                warp_value +
-                __shfl_down_sync(0xffffffffu, warp_value, offset);
+            block_value =
+                block_value +
+                __shfl_down_sync(0xffffffffu, block_value, offset);
         }
-
-        if (lane_id == 0) { values[warp_id] = warp_value; }
-        __syncthreads();
-
-        if (tid < 32) {
-            ComputeT block_value =
-                tid < blockDim.x / 32
-                    ? values[tid]
-                    : static_cast<ComputeT>(0);
-            for (uint offset = 16; offset > 0; offset /= 2) {
-                block_value =
-                    block_value +
-                    __shfl_down_sync(0xffffffffu, block_value, offset);
-            }
-            if (tid == 0) { partial.ptr[block_idx_x] = block_value; }
-        }
-    } else {
-        values[tid] = reduced;
-        __syncthreads();
-
-        ComputeT *line = values + tidy * blockDim.x;
-        for (uint offset = blockDim.x / 2; offset >= 32; offset /= 2) {
-            if (tidx < offset) {
-                line[tidx] = line[tidx] + line[tidx + offset];
-            }
-            __syncthreads();
-        }
-
-        if (tidx < 32) {
-            ComputeT warp_value = line[tidx];
-            for (uint offset = 16; offset > 0; offset /= 2) {
-                warp_value =
-                    warp_value +
-                    __shfl_down_sync(0xffffffffu, warp_value, offset);
-            }
-
-            if (tidx == 0 && valid) {
-                OutputT *output =
-                    partial.ptr +
-                    static_cast<int>(wid) * partial.strides[3] +
-                    static_cast<int>(zid) * partial.strides[2] +
-                    static_cast<int>(yid) * partial.strides[1];
-                output[block_idx_x] = static_cast<OutputT>(warp_value);
-            }
-        }
+        if (tid == 0) { partial.ptr[block_idx_x] = block_value; }
     }
 }
 
@@ -221,28 +193,26 @@ extern "C" __global__ void )JIT"
 
 template<typename Ti, typename To, af_op_t op>
 typename std::enable_if<!is_supported<Ti, To, op>::value, bool>::type launch(
-    Param<To>, const Array<Ti> &, bool, bool, double) {
+    Param<To>, const Array<Ti> &, bool, double) {
     return false;
 }
 
 template<typename Ti, typename To, af_op_t op>
 typename std::enable_if<is_supported<Ti, To, op>::value, bool>::type launch(
-    Param<To> out, const Array<Ti> &in, bool flatten, bool change_nan,
-    double nanval) {
+    Param<To> out, const Array<Ti> &in, bool change_nan, double nanval) {
     if (in.isReady() || in.elements() < minimum_elements ||
         in.elements() > INT_MAX) {
         return false;
     }
 
-    af::dim4 input_dims = in.dims();
-    if (flatten) { input_dims = af::dim4(in.elements()); }
-    if (input_dims[0] < minimum_reduced_elements) { return false; }
+    af::dim4 input_dims(in.elements());
     for (int dim = 0; dim < 4; ++dim) {
         if (input_dims[dim] > INT_MAX) { return false; }
     }
 
     jit::Consumer consumer(in.getNode(), in.dims());
-    constexpr size_t reduction_parameter_bytes = sizeof(Param<To>) + 128;
+    constexpr size_t reduction_parameter_bytes =
+        sizeof(Param<Ti>) + sizeof(Param<To>) + 128;
     if (!consumer.isLinear() ||
         consumer.outputNode().getType() !=
             static_cast<af::dtype>(af::dtype_traits<Ti>::af_type)) {
@@ -266,6 +236,21 @@ typename std::enable_if<is_supported<Ti, To, op>::value, bool>::type launch(
     uint blocks_y        = divup(extent1, threads_y);
     uint repeat          = divup(extent0, blocks_x * threads_x);
 
+    const uint64_t logical_blocks =
+        static_cast<uint64_t>(blocks_x) * blocks_y * extent2 * extent3;
+    const uint64_t target_blocks =
+        4ULL * getMultiProcessorCount(getActiveDeviceId());
+    if (consumer.hasExpensiveOperations() &&
+        logical_blocks < target_blocks) {
+        return false;
+    }
+    // Even cheap f64 trees lose to the established path at very small grids.
+    constexpr uint64_t minimum_double_blocks = 32;
+    if (std::is_same<Ti, double>::value &&
+        logical_blocks < minimum_double_blocks) {
+        return false;
+    }
+
     dim3 threads(threads_x, threads_y);
     dim3 blocks(blocks_x * extent2, blocks_y * extent3);
     const int max_blocks_y = getDeviceProp(getActiveDeviceId()).maxGridSize[1];
@@ -278,6 +263,9 @@ typename std::enable_if<is_supported<Ti, To, op>::value, bool>::type launch(
         1, partial_dims[0], partial_dims[0] * partial_dims[1],
         partial_dims[0] * partial_dims[1] * partial_dims[2]};
 
+    Array<Ti> materialized_array = createEmptyArray<Ti>(in.dims());
+    Param<Ti> materialized       = materialized_array;
+
     uptr<To> partial_allocation;
     Param<To> partial = out;
     if (blocks_x > 1) {
@@ -288,13 +276,14 @@ typename std::enable_if<is_supported<Ti, To, op>::value, bool>::type launch(
     }
 
     const std::string function_name = consumer.kernelName(
-        "_reduce_" + std::to_string(static_cast<int>(op)) + "_" +
+        "_reduce_all_materialize_" +
+        std::to_string(static_cast<int>(op)) + "_" +
         std::to_string(static_cast<int>(af::dtype_traits<To>::af_type)));
     const std::string final_function_name = function_name + "_final";
     CUfunction fused_reduce               = nullptr;
     CUmodule fused_module                 = nullptr;
-    const auto cached_module              = common::findModule(
-                     getActiveDeviceId(), common::deterministicHash(function_name));
+    const auto cached_module = common::findModule(
+        getActiveDeviceId(), deterministicHash(function_name));
     if (cached_module) {
         fused_module = cached_module.get();
         fused_reduce =
@@ -304,19 +293,19 @@ typename std::enable_if<is_supported<Ti, To, op>::value, bool>::type launch(
             makeSource<Ti, To>(consumer, function_name, final_function_name);
         common::saveKernel(function_name, source, ".cu");
         const common::Source kernel_source{source.c_str(), source.size(),
-                                           common::deterministicHash(source)};
+                                           deterministicHash(source)};
         auto kernel =
             common::getKernel(function_name, {{kernel_source}}, {}, {}, true);
         fused_module = kernel.getModuleHandle();
         fused_reduce = kernel.get();
     }
 
-    bool reduce_all  = flatten;
     bool replace_nan = change_nan;
     To replacement   = scalar<To>(nanval);
     std::vector<void *> arguments;
     arguments.reserve(consumer_parameter_bytes / sizeof(void *) + 12);
     consumer.appendArguments(arguments);
+    arguments.push_back(&materialized);
     arguments.push_back(&partial);
     arguments.push_back(&extent0);
     arguments.push_back(&extent1);
@@ -325,7 +314,6 @@ typename std::enable_if<is_supported<Ti, To, op>::value, bool>::type launch(
     arguments.push_back(&blocks_x);
     arguments.push_back(&blocks_y);
     arguments.push_back(&repeat);
-    arguments.push_back(&reduce_all);
     arguments.push_back(&replace_nan);
     arguments.push_back(&replacement);
 
@@ -335,39 +323,26 @@ typename std::enable_if<is_supported<Ti, To, op>::value, bool>::type launch(
     POST_LAUNCH_CHECK();
 
     if (blocks_x > 1) {
-        if (flatten) {
-            CUfunction final_reduce = nullptr;
-            CU_CHECK(cuModuleGetFunction(&final_reduce, fused_module,
-                                         final_function_name.c_str()));
-            uint partial_count      = blocks_x;
-            void *final_arguments[] = {&out, &partial, &partial_count};
-            CU_CHECK(cuLaunchKernel(final_reduce, 1, 1, 1, THREADS_PER_BLOCK, 1,
-                                    1, 0, getActiveStream(), final_arguments,
-                                    nullptr));
-            POST_LAUNCH_CHECK();
-        } else {
-            reduce_first_launcher<To, To, af_add_t>(
-                out, partial, 1, blocks_y, threads_x, change_nan, nanval);
-        }
+        CUfunction final_reduce = nullptr;
+        CU_CHECK(cuModuleGetFunction(&final_reduce, fused_module,
+                                     final_function_name.c_str()));
+        uint partial_count      = blocks_x;
+        void *final_arguments[] = {&out, &partial, &partial_count};
+        CU_CHECK(cuLaunchKernel(final_reduce, 1, 1, 1, THREADS_PER_BLOCK, 1, 1,
+                                0, getActiveStream(), final_arguments,
+                                nullptr));
+        POST_LAUNCH_CHECK();
     }
+    const_cast<Array<Ti> &>(in).swap(materialized_array);
     return true;
 }
 
 }  // namespace jit_reduce_detail
 
 template<typename Ti, typename To, af_op_t op>
-bool jitReduce(Param<To> out, const Array<Ti> &in, int dim, bool change_nan,
-               double nanval) {
-    if (dim != 0) { return false; }
-    return jit_reduce_detail::launch<Ti, To, op>(out, in, false, change_nan,
-                                                 nanval);
-}
-
-template<typename Ti, typename To, af_op_t op>
 bool jitReduceAll(Param<To> out, const Array<Ti> &in, bool change_nan,
                   double nanval) {
-    return jit_reduce_detail::launch<Ti, To, op>(out, in, true, change_nan,
-                                                 nanval);
+    return jit_reduce_detail::launch<Ti, To, op>(out, in, change_nan, nanval);
 }
 
 }  // namespace kernel

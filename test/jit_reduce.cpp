@@ -90,11 +90,11 @@ class JITReduce : public ::testing::Test {};
 using FloatingTypes = ::testing::Types<float, double>;
 TYPED_TEST_SUITE(JITReduce, FloatingTypes);
 
-TYPED_TEST(JITReduce, DimensionZeroUsesMultiplePartialBlocks) {
+TYPED_TEST(JITReduce, DimensionZeroLongLineFallback) {
     SUPPORTED_TYPE_CHECK(TypeParam);
 
-    // A dimension larger than one CUDA reduction block exercises the partial
-    // output and final reduction path. The total also meets the fusion cutoff.
+    // This shape exposed poor occupancy in the dimensional fused kernel.
+    // Dimensional sums deliberately retain the materialize-then-reduce path.
     const dim4 dims(32768, 2);
     array base = readyConstant<TypeParam>(TypeParam(1), dims);
 
@@ -104,7 +104,7 @@ TYPED_TEST(JITReduce, DimensionZeroUsesMultiplePartialBlocks) {
     expectDimensionSum<TypeParam>(lazyInput, referenceInput, 0);
 }
 
-TYPED_TEST(JITReduce, DimensionZeroHandlesNonPowerOfTwoPartialTail) {
+TYPED_TEST(JITReduce, DimensionZeroNonPowerOfTwoFallback) {
     SUPPORTED_TYPE_CHECK(TypeParam);
 
     const dim4 dims(10003, 7);
@@ -117,7 +117,7 @@ TYPED_TEST(JITReduce, DimensionZeroHandlesNonPowerOfTwoPartialTail) {
     expectDimensionSum<TypeParam>(lazyInput, referenceInput, 0);
 }
 
-TYPED_TEST(JITReduce, DimensionZeroMapsFourDimensionalLines) {
+TYPED_TEST(JITReduce, DimensionZeroFourDimensionalFallback) {
     SUPPORTED_TYPE_CHECK(TypeParam);
 
     const dim4 dims(257, 17, 5, 4);
@@ -143,7 +143,7 @@ TYPED_TEST(JITReduce, WholeArrayAtEligibilityBoundary) {
     expectWholeArraySum<TypeParam>(lazyInput, referenceInput);
 }
 
-TYPED_TEST(JITReduce, MultipleBuffersFeedTheFusedProducer) {
+TYPED_TEST(JITReduce, WholeArrayFusionConsumesMultipleBuffers) {
     SUPPORTED_TYPE_CHECK(TypeParam);
 
     const dim4 dims(16384, 4);
@@ -153,7 +153,7 @@ TYPED_TEST(JITReduce, MultipleBuffersFeedTheFusedProducer) {
     array lazyInput      = left * TypeParam(0.25) + right * TypeParam(0.5);
     array referenceInput = left * TypeParam(0.25) + right * TypeParam(0.5);
 
-    expectDimensionSum<TypeParam>(lazyInput, referenceInput, 0);
+    expectWholeArraySum<TypeParam>(lazyInput, referenceInput);
 }
 
 TYPED_TEST(JITReduce, ReplacesNanForDimensionAndWholeArraySums) {
@@ -173,9 +173,10 @@ TYPED_TEST(JITReduce, ReplacesNanForDimensionAndWholeArraySums) {
     base.eval();
 
     const double replacement = -4.0;
-    array lazyInput          = affine(base, TypeParam(2), TypeParam(1));
-    array actualDimension    = af::sum(lazyInput, 0, replacement);
-    array actualWhole        = af::sum<array>(lazyInput, replacement);
+    array lazyDimension   = affine(base, TypeParam(2), TypeParam(1));
+    array lazyWhole       = affine(base, TypeParam(2), TypeParam(1));
+    array actualDimension = af::sum(lazyDimension, 0, replacement);
+    array actualWhole     = af::sum<array>(lazyWhole, replacement);
 
     array referenceInput = affine(base, TypeParam(2), TypeParam(1));
     referenceInput.eval();
@@ -226,7 +227,7 @@ TYPED_TEST(JITReduce, CachedKernelReceivesFreshBufferAndScalarArguments) {
                        secondScalarsActual, tolerance<TypeParam>());
 }
 
-TYPED_TEST(JITReduce, NamedExpressionCanFeedTwoReductionConsumers) {
+TYPED_TEST(JITReduce, WholeArrayFusionCachesProducerForLaterConsumers) {
     SUPPORTED_TYPE_CHECK(TypeParam);
 
     const dim4 dims(minimumDimensionZero,
@@ -237,8 +238,12 @@ TYPED_TEST(JITReduce, NamedExpressionCanFeedTwoReductionConsumers) {
     array base            = readyConstant<TypeParam>(TypeParam(2), dims);
     array namedExpression = affine(base, TypeParam(2), TypeParam(1));
 
-    array actualDimension = af::sum(namedExpression, 0);
-    array actualWhole     = af::sum<array>(namedExpression);
+    // The whole-array sum consumes the lazy tree first. It must leave the
+    // producer materialized so later dimensional and whole-array consumers
+    // see the same values without evaluating the tree again.
+    array actualWhole      = af::sum<array>(namedExpression);
+    array actualDimension  = af::sum(namedExpression, 0);
+    array actualWholeAgain = af::sum<array>(namedExpression);
 
     array referenceInput = affine(base, TypeParam(2), TypeParam(1));
     referenceInput.eval();
@@ -248,6 +253,29 @@ TYPED_TEST(JITReduce, NamedExpressionCanFeedTwoReductionConsumers) {
     ASSERT_ARRAYS_NEAR(expectedDimension, actualDimension,
                        tolerance<TypeParam>());
     ASSERT_ARRAYS_NEAR(expectedWhole, actualWhole, tolerance<TypeParam>());
+    ASSERT_ARRAYS_NEAR(expectedWhole, actualWholeAgain, tolerance<TypeParam>());
+}
+
+TYPED_TEST(JITReduce, ExpensiveWholeArrayProducerAtBoundary) {
+    SUPPORTED_TYPE_CHECK(TypeParam);
+
+    const dim4 dims(256, 256);
+    array left  = readyRange<TypeParam>(dims, 0);
+    array right = readyRange<TypeParam>(dims, 1);
+    const TypeParam scale = TypeParam(1.0 / 256.0);
+    left *= scale;
+    right *= scale;
+    left.eval();
+    right.eval();
+
+    array lazyInput =
+        af::sin(left) * af::cos(right) +
+        af::sqrt(af::abs(left - right) + TypeParam(1));
+    array referenceInput =
+        af::sin(left) * af::cos(right) +
+        af::sqrt(af::abs(left - right) + TypeParam(1));
+
+    expectWholeArraySum<TypeParam>(lazyInput, referenceInput);
 }
 
 TYPED_TEST(JITReduce, ReadySmallAndShortDimensionZeroInputsRemainCorrect) {
@@ -316,6 +344,9 @@ TYPED_TEST(JITReduce, NonLinearExpressionShapesRemainCorrect) {
         expectDimensionSum<TypeParam>(
             affine(gapped, TypeParam(0.5), TypeParam(1)),
             affine(gapped, TypeParam(0.5), TypeParam(1)), 0);
+        expectWholeArraySum<TypeParam>(
+            affine(gapped, TypeParam(0.5), TypeParam(1)),
+            affine(gapped, TypeParam(0.5), TypeParam(1)));
     }
 
     {
@@ -326,6 +357,7 @@ TYPED_TEST(JITReduce, NonLinearExpressionShapesRemainCorrect) {
         array column = readyRange<TypeParam>(dim4(dims[0], 1), 0);
 
         expectDimensionSum<TypeParam>(rows + column, rows + column, 0);
+        expectWholeArraySum<TypeParam>(rows + column, rows + column);
     }
 
     {
@@ -334,6 +366,9 @@ TYPED_TEST(JITReduce, NonLinearExpressionShapesRemainCorrect) {
 
         expectDimensionSum<TypeParam>(af::shift(base, 0, 1) + TypeParam(1),
                                       af::shift(base, 0, 1) + TypeParam(1), 0);
+        expectWholeArraySum<TypeParam>(
+            af::shift(base, 0, 1) + TypeParam(1),
+            af::shift(base, 0, 1) + TypeParam(1));
     }
 
     {
@@ -344,6 +379,11 @@ TYPED_TEST(JITReduce, NonLinearExpressionShapesRemainCorrect) {
             affine(base, TypeParam(2), TypeParam(1)), dim4(256, 256));
 
         expectDimensionSum<TypeParam>(lazyInput, referenceInput, 0);
+        expectWholeArraySum<TypeParam>(
+            af::moddims(affine(base, TypeParam(2), TypeParam(1)),
+                        dim4(256, 256)),
+            af::moddims(affine(base, TypeParam(2), TypeParam(1)),
+                        dim4(256, 256)));
     }
 }
 

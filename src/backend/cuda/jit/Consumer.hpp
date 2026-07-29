@@ -59,6 +59,56 @@ class Consumer {
     int outputId() const { return output_id_; }
     const common::Node &outputNode() const { return *nodes_[output_id_]; }
 
+    bool hasExpensiveOperations() const {
+        // Unknown operations default to expensive so new JIT nodes cannot
+        // silently bypass the occupancy guard.
+        return std::any_of(nodes_.begin(), nodes_.end(),
+                           [](const common::Node *node) {
+                               switch (node->getOp()) {
+                                   case af_none_t:
+                                   case af_add_t:
+                                   case af_sub_t:
+                                   case af_mul_t:
+                                   case af_and_t:
+                                   case af_or_t:
+                                   case af_eq_t:
+                                   case af_neq_t:
+                                   case af_lt_t:
+                                   case af_le_t:
+                                   case af_gt_t:
+                                   case af_ge_t:
+                                   case af_bitor_t:
+                                   case af_bitand_t:
+                                   case af_bitxor_t:
+                                   case af_bitshiftl_t:
+                                   case af_bitshiftr_t:
+                                   case af_bitnot_t:
+                                   case af_min_t:
+                                   case af_max_t:
+                                   case af_cplx2_t:
+                                   case af_abs_t:
+                                   case af_cast_t:
+                                   case af_cplx_t:
+                                   case af_real_t:
+                                   case af_imag_t:
+                                   case af_conj_t:
+                                   case af_floor_t:
+                                   case af_ceil_t:
+                                   case af_round_t:
+                                   case af_trunc_t:
+                                   case af_signbit_t:
+                                   case af_notzero_t:
+                                   case af_iszero_t:
+                                   case af_isinf_t:
+                                   case af_isnan_t:
+                                   case af_noop_t:
+                                   case af_select_t:
+                                   case af_not_select_t: return false;
+                                   default: return true;
+                               }
+                           });
+    }
+
     std::string kernelName(const std::string &suffix) const {
         std::vector<common::Node *> outputs{root_.get()};
         std::vector<int> output_ids{output_id_};

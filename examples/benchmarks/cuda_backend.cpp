@@ -227,6 +227,20 @@ af::array reductionProducer(const af::array &lhs, const af::array &rhs) {
     return af::sin(lhs) * af::cos(rhs) + af::sqrt(af::abs(lhs - rhs) + 1.0f);
 }
 
+af::array f64ReductionProducer(const af::array &lhs, const af::array &rhs) {
+    return af::sin(lhs) * af::cos(rhs) + af::sqrt(af::abs(lhs - rhs) + 1.0);
+}
+
+af::array f64DeepReductionProducer(const af::array &lhs,
+                                   const af::array &rhs) {
+    af::array value = lhs * 0.75 + rhs * 0.25 + 0.125;
+    value           = af::sin(value) + af::cos(lhs - rhs);
+    value = value * value + af::sqrt(af::abs(lhs + rhs) + 1.0);
+    return af::tanh(value) + value * 0.5;
+}
+
+enum class F64Producer { Affine, Complex, Deep };
+
 void runJitReductions(const Options &options, cudaStream_t stream) {
     const bool runDim0 = selected(options, "reduce_jit_dim0") ||
                          selected(options, "reduce_jit_dim0_materialized");
@@ -303,6 +317,104 @@ void runJitReductions(const Options &options, cudaStream_t stream) {
         };
         printMetrics("reduce_jit_reuse_materialized", reduction,
                      measure(work, reduction.iterations, stream));
+    }
+}
+
+void runJitReductionRegressions(const Options &options, cudaStream_t stream) {
+    auto runF64 = [&](const char *name, dim_t size, bool preEvaluate,
+                      F64Producer producer) {
+        if (!selected(options, name)) { return; }
+
+        Options reduction = options;
+        reduction.size    = size;
+        af::deviceGC();
+        af::array lhs = af::randu(size, size, f64);
+        af::array rhs = af::randu(size, size, f64);
+        materialize(lhs);
+        materialize(rhs);
+
+        Work work = [lhs, rhs, preEvaluate, producer]() {
+            af::array expression;
+            if (producer == F64Producer::Affine) {
+                expression = lhs * 1.25 + rhs * 0.5 + 0.25;
+            } else if (producer == F64Producer::Complex) {
+                expression = f64ReductionProducer(lhs, rhs);
+            } else {
+                expression = f64DeepReductionProducer(lhs, rhs);
+            }
+            if (preEvaluate) { expression.eval(); }
+            return af::sum<af::array>(expression);
+        };
+        printMetrics(name, reduction,
+                     measure(work, reduction.iterations, stream));
+    };
+
+    runF64("reduce_jit_all_f64_affine_256", 256, false,
+           F64Producer::Affine);
+    runF64("reduce_jit_all_f64_affine_256_materialized", 256, true,
+           F64Producer::Affine);
+    runF64("reduce_jit_all_f64_complex_256", 256, false,
+           F64Producer::Complex);
+    runF64("reduce_jit_all_f64_complex_256_materialized", 256, true,
+           F64Producer::Complex);
+    runF64("reduce_jit_all_f64_deep_1024", 1024, false, F64Producer::Deep);
+    runF64("reduce_jit_all_f64_deep_1024_materialized", 1024, true,
+           F64Producer::Deep);
+
+    const bool runReuse = selected(options, "reduce_jit_all_reuse4") ||
+                          selected(options,
+                                   "reduce_jit_all_reuse4_materialized");
+    if (runReuse) {
+        Options reduction = options;
+        reduction.size    = 1024;
+        af::deviceGC();
+        af::array lhs = af::randu(reduction.size, reduction.size, f32);
+        af::array rhs = af::randu(reduction.size, reduction.size, f32);
+        materialize(lhs);
+        materialize(rhs);
+
+        auto run = [&](const char *name, bool materialized) {
+            if (!selected(options, name)) { return; }
+            Work work = [lhs, rhs, materialized]() {
+                af::array expression = reductionProducer(lhs, rhs);
+                if (materialized) { expression.eval(); }
+                af::array result = af::sum<af::array>(expression);
+                for (int consumer = 1; consumer < 4; ++consumer) {
+                    result += af::sum<af::array>(expression);
+                }
+                return result;
+            };
+            printMetrics(name, reduction,
+                         measure(work, reduction.iterations, stream));
+        };
+        run("reduce_jit_all_reuse4", false);
+        run("reduce_jit_all_reuse4_materialized", true);
+    }
+
+    const bool runLongLine =
+        selected(options, "reduce_jit_dim0_complex_32768x2") ||
+        selected(options, "reduce_jit_dim0_complex_32768x2_materialized");
+    if (runLongLine) {
+        Options reduction = options;
+        reduction.size    = 32768;
+        af::deviceGC();
+        af::array lhs = af::randu(32768, 2, f32);
+        af::array rhs = af::randu(32768, 2, f32);
+        materialize(lhs);
+        materialize(rhs);
+
+        auto run = [&](const char *name, bool materialized) {
+            if (!selected(options, name)) { return; }
+            Work work = [lhs, rhs, materialized]() {
+                af::array expression = reductionProducer(lhs, rhs);
+                if (materialized) { expression.eval(); }
+                return af::sum(expression, 0);
+            };
+            printMetrics(name, reduction,
+                         measure(work, reduction.iterations, stream));
+        };
+        run("reduce_jit_dim0_complex_32768x2", false);
+        run("reduce_jit_dim0_complex_32768x2_materialized", true);
     }
 }
 
@@ -743,6 +855,16 @@ Options parseOptions(int argc, char **argv) {
                          "reduce_jit_dim0, reduce_jit_dim0_materialized, "
                          "reduce_jit_all, reduce_jit_all_materialized, "
                          "reduce_jit_reuse, reduce_jit_reuse_materialized, "
+                         "reduce_jit_all_f64_affine_256, "
+                         "reduce_jit_all_f64_affine_256_materialized, "
+                         "reduce_jit_all_f64_complex_256, "
+                         "reduce_jit_all_f64_complex_256_materialized, "
+                         "reduce_jit_all_f64_deep_1024, "
+                         "reduce_jit_all_f64_deep_1024_materialized, "
+                         "reduce_jit_all_reuse4, "
+                         "reduce_jit_all_reuse4_materialized, "
+                         "reduce_jit_dim0_complex_32768x2, "
+                         "reduce_jit_dim0_complex_32768x2_materialized, "
                          "reduce_jit_short_dim0, reduce_jit_gapped, "
                          "matmul, matmul_batched_8, "
                          "matmul_batched_d2_broadcast_8, matmul_batched_256, "
@@ -801,6 +923,7 @@ int main(int argc, char **argv) {
         runJitGapped(options, stream);
         runReduction(options, stream);
         runJitReductions(options, stream);
+        runJitReductionRegressions(options, stream);
         runShortJitReduction(options, stream);
         runGappedJitReduction(options, stream);
         runMatmul(options, stream);

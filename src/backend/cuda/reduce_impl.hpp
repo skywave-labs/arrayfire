@@ -36,9 +36,7 @@ Array<To> reduce(const Array<Ti> &in, const int dim, bool change_nan,
     dim4 odims    = in.dims();
     odims[dim]    = 1;
     Array<To> out = createEmptyArray<To>(odims);
-    if (!kernel::jitReduce<Ti, To, op>(out, in, dim, change_nan, nanval)) {
-        kernel::reduce<Ti, To, op>(out, in, dim, change_nan, nanval);
-    }
+    kernel::reduce<Ti, To, op>(out, in, dim, change_nan, nanval);
     return out;
 }
 
