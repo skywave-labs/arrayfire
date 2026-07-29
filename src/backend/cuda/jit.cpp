@@ -20,6 +20,7 @@
 #include <debug_cuda.hpp>
 #include <device_manager.hpp>
 #include <err_cuda.hpp>
+#include <jit/Consumer.hpp>
 #include <jit/ShiftNode.hpp>
 #include <kernel_headers/jit_cuh.hpp>
 #include <math.hpp>
@@ -64,6 +65,15 @@ using std::vector;
 namespace arrayfire {
 namespace cuda {
 
+namespace jit {
+
+const std::string& getKernelPreamble() {
+    static const std::string preamble(jit_cuh, jit_cuh_len);
+    return preamble;
+}
+
+}  // namespace jit
+
 static string getKernelString(const string& funcName,
                               const vector<Node*>& full_nodes,
                               const vector<Node_ids>& full_ids,
@@ -71,7 +81,7 @@ static string getKernelString(const string& funcName,
                               const bool is_linear, const bool loop0,
                               const bool loop1, const bool loop2,
                               const bool loop3) {
-    const std::string includeFileStr(jit_cuh, jit_cuh_len);
+    const std::string& includeFileStr = jit::getKernelPreamble();
 
     const std::string paramTStr = R"JIT(
 template<typename T>

@@ -335,6 +335,7 @@ add_library(afcuda
     kernel/interp.hpp
     kernel/iota.hpp
     kernel/ireduce.hpp
+    kernel/jit_reduce.hpp
     kernel/lookup.hpp
     kernel/lu_split.hpp
     kernel/match_template.hpp
@@ -566,6 +567,7 @@ add_library(afcuda
     wrap.hpp
 
     jit/BufferNode.hpp
+    jit/Consumer.hpp
     jit/ShiftNode.hpp
     jit/kernel_generators.hpp
 

@@ -15,6 +15,7 @@
 #include <Array.hpp>
 #include <Event.hpp>
 #include <err_cuda.hpp>
+#include <kernel/jit_reduce.hpp>
 #include <kernel/reduce.hpp>
 #include <kernel/reduce_by_key.hpp>
 #include <reduce.hpp>
@@ -356,7 +357,9 @@ void reduce_by_key(Array<Tk> &keys_out, Array<To> &vals_out,
 template<af_op_t op, typename Ti, typename To>
 Array<To> reduce_all(const Array<Ti> &in, bool change_nan, double nanval) {
     Array<To> out = createEmptyArray<To>(1);
-    kernel::reduce_all<Ti, To, op>(out, in, change_nan, nanval);
+    if (!kernel::jitReduceAll<Ti, To, op>(out, in, change_nan, nanval)) {
+        kernel::reduce_all<Ti, To, op>(out, in, change_nan, nanval);
+    }
     return out;
 }
 
