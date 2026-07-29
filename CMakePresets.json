@@ -108,6 +108,16 @@
       }
     },
     {
+      "name": "ninja-cuda-benchmark-relwithdebinfo",
+      "description": "Configure the CUDA backend benchmark in RelWithDebInfo configuration using Ninja Generator",
+      "inherits": "ninja-cuda-relwithdebinfo",
+      "cacheVariables": {
+        "AF_BUILD_EXAMPLES": "ON",
+        "AF_BUILD_FORGE": "OFF",
+        "BUILD_TESTING": "OFF"
+      }
+    },
+    {
       "name": "ninja-opencl-mkl-debug",
       "description": "Build OpenCL Backend in debug configuration using Ninja Generator",
       "inherits": "ninja-all-off-debug",
@@ -254,6 +264,16 @@
       "name": "msvc2019-all-mkl-standalone-install",
       "description": "Build all feasible Backends with MSVC 2019 Generator. Also packages dependencies while installing to specified path prefix.",
       "inherits": [ "msvc2019", "ninja-all-mkl-standalone-install" ]
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "ninja-cuda-benchmark-relwithdebinfo",
+      "description": "Build only the CUDA backend benchmark",
+      "configurePreset": "ninja-cuda-benchmark-relwithdebinfo",
+      "targets": [
+        "cuda_backend_cuda"
+      ]
     }
   ]
 }

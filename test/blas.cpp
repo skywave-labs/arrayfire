@@ -441,6 +441,77 @@ TEST(MatrixMultiplyBatchPointers, GridTailAndDim2Broadcast) {
     ASSERT_ARRAYS_EQ(rhsBroadcastExpected, rhsBroadcastOut);
 }
 
+#if defined(AF_CUDA)
+TEST(MatrixMultiplyBatchPointers, GridTailAndDim2BroadcastRoutesEverySlice) {
+    constexpr dim_t m         = 3;
+    constexpr dim_t k         = 2;
+    constexpr dim_t n         = 4;
+    constexpr dim_t batchDim2 = 257;
+    constexpr dim_t batchDim3 = 3;
+
+    // 257 * 3 leaves a partial final block in the CUDA pointer setup kernel.
+    // Give every batch slice a distinct value so incorrect z/w routing cannot
+    // be hidden by batch-invariant inputs.
+    vector<float> lhsBroadcastValues(m * k * batchDim3);
+    vector<float> rhsBatchedValues(k * n * batchDim2 * batchDim3);
+    vector<float> lhsBatchedValues(m * k * batchDim2 * batchDim3);
+    vector<float> rhsBroadcastValues(k * n * batchDim3);
+    vector<float> lhsBroadcastExpectedValues(m * n * batchDim2 * batchDim3);
+    vector<float> rhsBroadcastExpectedValues(m * n * batchDim2 * batchDim3);
+
+    for (dim_t w = 0; w < batchDim3; ++w) {
+        const float lhsBroadcastValue = static_cast<float>(w + 2);
+        const float rhsBroadcastValue = static_cast<float>(w + 3);
+        std::fill(lhsBroadcastValues.begin() + w * m * k,
+                  lhsBroadcastValues.begin() + (w + 1) * m * k,
+                  lhsBroadcastValue);
+        std::fill(rhsBroadcastValues.begin() + w * k * n,
+                  rhsBroadcastValues.begin() + (w + 1) * k * n,
+                  rhsBroadcastValue);
+
+        for (dim_t z = 0; z < batchDim2; ++z) {
+            const float rhsBatchedValue =
+                static_cast<float>(z + batchDim2 * w + 1);
+            const float lhsBatchedValue =
+                static_cast<float>(2 * z + batchDim2 * w + 1);
+            const size_t inputOffset =
+                static_cast<size_t>(z + batchDim2 * w) * k * n;
+            const size_t lhsInputOffset =
+                static_cast<size_t>(z + batchDim2 * w) * m * k;
+            const size_t outputOffset =
+                static_cast<size_t>(z + batchDim2 * w) * m * n;
+
+            std::fill(rhsBatchedValues.begin() + inputOffset,
+                      rhsBatchedValues.begin() + inputOffset + k * n,
+                      rhsBatchedValue);
+            std::fill(lhsBatchedValues.begin() + lhsInputOffset,
+                      lhsBatchedValues.begin() + lhsInputOffset + m * k,
+                      lhsBatchedValue);
+            std::fill(
+                lhsBroadcastExpectedValues.begin() + outputOffset,
+                lhsBroadcastExpectedValues.begin() + outputOffset + m * n,
+                static_cast<float>(k * lhsBroadcastValue * rhsBatchedValue));
+            std::fill(
+                rhsBroadcastExpectedValues.begin() + outputOffset,
+                rhsBroadcastExpectedValues.begin() + outputOffset + m * n,
+                static_cast<float>(k * lhsBatchedValue * rhsBroadcastValue));
+        }
+    }
+
+    array lhsBroadcast(dim4(m, k, 1, batchDim3), lhsBroadcastValues.data());
+    array rhsBatched(dim4(k, n, batchDim2, batchDim3), rhsBatchedValues.data());
+    array lhsBroadcastExpected(dim4(m, n, batchDim2, batchDim3),
+                               lhsBroadcastExpectedValues.data());
+    ASSERT_ARRAYS_EQ(lhsBroadcastExpected, matmul(lhsBroadcast, rhsBatched));
+
+    array lhsBatched(dim4(m, k, batchDim2, batchDim3), lhsBatchedValues.data());
+    array rhsBroadcast(dim4(k, n, 1, batchDim3), rhsBroadcastValues.data());
+    array rhsBroadcastExpected(dim4(m, n, batchDim2, batchDim3),
+                               rhsBroadcastExpectedValues.data());
+    ASSERT_ARRAYS_EQ(rhsBroadcastExpected, matmul(lhsBatched, rhsBroadcast));
+}
+#endif
+
 TEST(MatrixMultiplyBatchPointers, GappedFourDimensionalInputs) {
     const dim_t batchDim2 = 4;
     const dim_t batchDim3 = 3;
