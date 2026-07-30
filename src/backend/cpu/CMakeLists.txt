@@ -279,10 +279,16 @@ target_sources(afcpu
     kernel/transpose.hpp
     kernel/transpose_avx2.cpp
     kernel/transpose_avx2.hpp
+    kernel/transpose_neon.hpp
     kernel/triangle.hpp
     kernel/unwrap.hpp
     kernel/wrap.hpp
   )
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|AARCH64|arm64|ARM64)$")
+  target_sources(afcpu PRIVATE kernel/transpose_neon.cpp)
+  target_compile_definitions(afcpu PRIVATE AF_CPU_COMPILE_NEON_TRANSPOSE)
+endif()
 
 set(AF_CPU_MSVC_X86 OFF)
 if(MSVC)
